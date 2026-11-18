@@ -135,8 +135,8 @@ def clean_nodes(s, nodes):
         picked = []
         for raw in node.get('users', []) or []:
             account = s.get(User, int(raw))
-            if not account or account.role != role:
-                raise ValueError('审批人「' + label + '」不存在或角色不符')
+            if not account or not account.enabled or account.role != role:
+                raise ValueError('审批人「' + label + '」不存在、已停用或角色不符')
             picked.append(int(raw))
         picked = list(dict.fromkeys(picked))
         if mode != 'any' and not picked:

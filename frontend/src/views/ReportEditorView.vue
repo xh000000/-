@@ -60,6 +60,11 @@
     <!-- 组件化编辑器 -->
     <div v-else-if="draft" class="edit-body">
       <aside class="chapter-list">
+        <div v-if="report.category_id" class="chapter-template">
+          <span>分类模板：{{ templateInfo?.category_name || paperCfg.category_name || '当前分类' }}</span>
+          <small>章节/审批 v{{ paperCfg.revision || '—' }}<template v-if="templateInfo"> · 最新 v{{ templateInfo.revision }}</template></small>
+          <el-button v-if="creator && editable" link type="primary" :loading="templateLoading" :disabled="busy" @click="openTemplateSync">同步分类章节与审批</el-button>
+        </div>
         <div class="chapter-list-head">
           <b>研报章节</b>
           <el-button v-if="creator && editable" type="primary" size="small" @click="chapterStructure('add')">添加章节</el-button>
@@ -78,6 +83,7 @@
               </button>
               <div class="chapter-card-foot">
                 <span>{{ node.item.state || '未提交' }}</span>
+                <el-tag v-if="(meta?.retained_section_ids || []).includes(node.item.id)" size="small" type="info">保留章节</el-tag>
                 <el-button
                   v-if="creator && editable"
                   link
@@ -125,7 +131,7 @@
         </div>
 
         <div class="canvas-scroll">
-          <div class="canvas-paper" :class="{ 'free-paper': draft.layout === 'free' }">
+          <div class="canvas-paper" :class="{ 'free-paper': draft.layout === 'free' }" :style="freePaperHeight ? { minHeight: freePaperHeight + 'px' } : null">
             <h3>
               <span v-if="section?.label" class="chapter-no">{{ section.label }}</span>
               <span v-else-if="!section?.title" class="chapter-no">第{{ chapterIndex + 1 }}章</span>{{ section?.title }}
@@ -226,18 +232,21 @@
     </el-dialog>
 
     <!-- 章节设置 -->
-    <el-dialog v-model="chapterVisible" title="章节基础信息" width="560px">
+    <el-dialog v-model="chapterVisible" title="章节设置" width="620px">
+      <p class="caption" style="margin-bottom: 12px">字段与分类模板对应，本次保存仅影响当前研报。</p>
       <el-form label-width="92px">
+        <el-form-item label="一级章节"><el-input v-model="chapterForm.group" maxlength="60" placeholder="如：三、金融与商品基本面展望" /></el-form-item>
+        <el-form-item label="章节编号"><el-input v-model="chapterForm.label" maxlength="20" placeholder="如 01、02、一、" /><p class="caption">可直接修改编号；上下移动章节时，同组的普通数字编号会按顺序整理。</p></el-form-item>
         <el-form-item label="章节名称">
           <el-input v-model="chapterForm.title" maxlength="100" placeholder="可留空，留空时版面只显示编号" />
         </el-form-item>
+        <el-form-item label="类型"><el-input v-model="chapterForm.type" maxlength="80" placeholder="如：宏观、供需" /></el-form-item>
+        <el-form-item label="必填"><el-switch v-model="chapterForm.required" /></el-form-item>
+        <el-form-item label="默认文字"><el-input v-model="chapterForm.default" type="textarea" :rows="3" /><p class="caption">用于章节骨架和生成提示，不会自动覆盖正文。</p></el-form-item>
         <el-form-item label="编辑人">
           <el-checkbox-group v-model="chapterForm.editors">
             <el-checkbox v-for="id in chapterPeople" :key="id" :value="id">{{ memberName(id) }}</el-checkbox>
           </el-checkbox-group>
-        </el-form-item>
-        <el-form-item label="章节标签">
-          <el-input v-model="chapterForm.tags" placeholder="逗号分隔，最多 20 个" />
         </el-form-item>
         <el-form-item label="关联品种">
           <div style="width: 100%">
@@ -268,6 +277,10 @@
           </div>
         </el-form-item>
       </el-form>
+      <div class="chapter-workflow"><h4>本研报审批流程</h4><p class="caption">审批按整篇研报执行，来自分类模板或匹配的审批流设置。</p>
+        <ol><li v-for="(node, index) in paperCfg.workflow || []" :key="index"><b>{{ node.label }}</b> · {{ MODE_NAMES[node.mode] || node.mode }}<span class="caption"> · {{ node.users?.length ? node.users.map(memberName).join('、') : '该角色启用账号' }}</span></li></ol>
+        <el-button v-if="user.role === 'admin' && report.category_id" link type="primary" @click="router.push({ path: '/config/categories', query: { category: String(report.category_id) } })">打开分类章节与审批配置</el-button>
+      </div>
       <template #footer>
         <el-button @click="chapterVisible = false">取消</el-button>
         <el-button @click="chapterStructure('up')">上移</el-button>
@@ -328,9 +341,21 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="templateSyncVisible" title="同步分类章节与审批" width="680px" :close-on-click-modal="false">
+      <template v-if="templateInfo">
+        <p>{{ templateInfo.category_name }} · v{{ templateInfo.revision }}</p>
+        <el-alert type="info" :closable="false" show-icon title="同步仅更新当前研报的章节和审批配置，保留正文与版式。同步后章节恢复未提交，需要重新确认。" style="margin: 14px 0" />
+        <p>新增 {{ templateInfo.added?.length || 0 }} 章，更新 {{ templateInfo.updated?.length || 0 }} 章，移除空章节 {{ templateInfo.removed_empty?.length || 0 }} 章。</p>
+        <p v-if="templateInfo.retained?.length">已有内容或自建章节将保留：{{ templateInfo.retained.map(item => item.title || item.label || '未命名章节').join('、') }}</p>
+        <h4>最新章节顺序</h4><ol><li v-for="item in templateInfo.sections" :key="item.id">{{ item.group }} / {{ item.label }} {{ item.title || '未命名章节' }} <small v-if="item.required">（必填）</small></li></ol>
+        <h4>审批流程{{ templateInfo.workflow_changed ? '（将更新）' : '' }}</h4><p>{{ (templateInfo.workflow || []).map(node => `${node.label}（${MODE_NAMES[node.mode] || node.mode}）`).join(' → ') }} → 发布</p>
+      </template>
+      <template #footer><el-button @click="templateSyncVisible = false">取消</el-button><el-button type="primary" :loading="busy" :disabled="!templateInfo?.can_sync" @click="syncTemplate">确认同步当前研报</el-button></template>
+    </el-dialog>
+
     <!-- 插入指标 -->
     <el-dialog v-model="pickerVisible" :title="pickerKind === 'chart' ? '插入指标图表' : '插入数据表格'" width="520px">
-      <el-select v-model="pickerIndex" style="width: 100%" placeholder="选择指标">
+      <el-select v-model="pickerIndex" :disabled="inserting" style="width: 100%" placeholder="选择指标">
         <el-option
           v-for="(item, index) in indicators"
           :key="index"
@@ -338,10 +363,10 @@
           :value="index"
         />
       </el-select>
-      <p class="caption" style="margin-top: 10px">保存时由服务端生成数据快照，之后可「刷新数据并保存」更新。</p>
+      <p class="caption" style="margin-top: 10px">插入后立即显示指标数据；保存后固定为研报快照，之后可通过「刷新数据并保存」更新。</p>
       <template #footer>
         <el-button @click="pickerVisible = false">取消</el-button>
-        <el-button type="primary" @click="confirmInsert">插入当前章节</el-button>
+        <el-button type="primary" :loading="inserting" :disabled="inserting" @click="confirmInsert">插入当前章节</el-button>
       </template>
     </el-dialog>
 
@@ -397,7 +422,7 @@ import { api, fileUrl, printUrl } from '../api';
 import {
   authors, commodities, library, memberName, indicators, refresh, reportById, user,
 } from '../store/session';
-import { localTime, escapeHtml, makeId, parseJSON, statusText, today } from '../utils/format';
+import { localTime, escapeHtml, makeId, parseJSON, statusText, today, MODE_NAMES } from '../utils/format';
 
 const route = useRoute();
 const router = useRouter();
@@ -425,6 +450,8 @@ let draftVersion = 0;
 let snapshot = '';
 
 const section = computed(() => draft.value?.sections?.[chapterIndex.value] || null);
+const freePaperHeight = computed(() => draft.value?.layout === 'free'
+  ? Math.max(620, ...(section.value?.blocks || []).map((block, index) => (block.y ?? 70 + index * 230) + (block.height ?? 210) + 40)) : null);
 const sectionEditable = computed(() => (section.value ? chapterEditable(section.value) : false));
 
 /* 空组件判定：预览与「本章暂无内容」提示共用 */
@@ -657,6 +684,7 @@ async function chapterState(action) {
 async function chapterStructure(action, payload = {}) {
   if (dirty.value) return ElMessage.warning('请先保存当前章节');
   busy.value = true;
+  const selectedId = section.value?.id;
   try {
     await api('chapters', {
       id: report.value.id,
@@ -668,6 +696,8 @@ async function chapterStructure(action, payload = {}) {
     chapterVisible.value = false;
     await refresh();
     initDraft(true);
+    const selected = draft.value.sections.findIndex(item => item.id === selectedId);
+    chapterIndex.value = action === 'add' ? draft.value.sections.length - 1 : selected >= 0 ? selected : Math.min(chapterIndex.value, draft.value.sections.length - 1);
     ElMessage.success('章节结构已更新');
   } catch (error) {
     ElMessage.error(error.message || '操作失败');
@@ -693,13 +723,17 @@ function blockAction(index, action) {
 const pickerVisible = ref(false);
 const pickerKind = ref('chart');
 const pickerIndex = ref(0);
+const inserting = ref(false);
+let insertRequest = 0;
+watch(pickerVisible, visible => { if (!visible) { insertRequest++; inserting.value = false; } });
+onBeforeUnmount(() => { insertRequest++; });
 const imageVisible = ref(false);
 const imageItems = computed(() => library.value.filter(item => item.kind === 'image'));
 
 function insert(kind) {
   if (kind === 'text') {
     const block = { id: makeId(), type: 'text', span: 12, title: '', text: '', html: '' };
-    section.value.blocks.push(block);
+    appendBlock(block);
     // 空块默认不渲染，刚插入的这块要留着并聚焦，用户才能直接写字
     pendingBlockId.value = block.id;
     nextTick(() => {
@@ -712,31 +746,50 @@ function insert(kind) {
     imageVisible.value = true;
     return;
   }
-  if (!indicators.value.length) return ElMessage.warning('尚无指标，请先在数据中心导入 CSV');
+  if (!indicators.value.length) return ElMessage.warning('暂无可用指标，请先在数据录入中同步或导入数据');
+  insertRequest++;
   pickerKind.value = kind;
   pickerIndex.value = 0;
   pickerVisible.value = true;
 }
 
-function confirmInsert() {
+function appendBlock(block, target = section.value) {
+  const blocks = target.blocks;
+  if (draft.value.layout === 'free') {
+    const bottom = Math.max(54, ...blocks.map((item, index) => (item.y ?? 70 + index * 230) + (item.height ?? 210)));
+    Object.assign(block, { x: 30, y: blocks.length ? bottom + 16 : 70, width: 620,
+      height: block.type === 'table' ? 420 : block.type === 'chart' ? 300 : 210 });
+  }
+  blocks.push(block);
+}
+
+async function confirmInsert() {
+  if (inserting.value || !sectionEditable.value) return;
   const item = indicators.value[pickerIndex.value];
-  if (!item) return;
-  section.value.blocks.push({
-    id: makeId(),
-    type: pickerKind.value,
-    span: 12,
-    title: item.indicator,
-    source: item.source,
-    indicator: item.indicator,
-    data: [],
-    refreshed_at: '待保存时获取',
-  });
-  pickerVisible.value = false;
-  ElMessage.success('已插入引用，保存后加载数据');
+  if (!item) return ElMessage.warning('请选择指标');
+  const target = section.value;
+  const document = draft.value;
+  const kind = pickerKind.value;
+  const request = ++insertRequest;
+  inserting.value = true;
+  try {
+    const query = new URLSearchParams({ source: item.source, indicator: item.indicator });
+    const result = await api(`data/series?${query.toString()}`);
+    if (request !== insertRequest || !pickerVisible.value || section.value !== target || draft.value !== document || !sectionEditable.value) return;
+    const rows = (result.points || []).slice(-500).map(point => ({ source: item.source, indicator: item.indicator,
+      date: point.date, value: point.value, unit: point.unit || result.unit || item.unit || '' }));
+    if (!rows.length) return ElMessage.warning('该指标暂无数据，请刷新指标或选择其他指标');
+    if (new Set(rows.map(row => row.unit)).size > 1) return ElMessage.warning('该指标存在不同单位，请先统一数据单位');
+    appendBlock({ id: makeId(), type: kind, span: 12, title: item.indicator, source: item.source,
+      indicator: item.indicator, data: rows, preview: true, refreshed_at: '' });
+    pickerVisible.value = false;
+    ElMessage.success('已插入并显示数据，保存后固定为研报快照');
+  } catch (error) { if (request === insertRequest) ElMessage.error(error.message || '加载指标数据失败，请重试'); }
+  finally { if (request === insertRequest) inserting.value = false; }
 }
 
 function pickImage(item) {
-  section.value.blocks.push({
+  appendBlock({
     id: makeId(),
     type: 'image',
     span: 12,
@@ -771,7 +824,7 @@ async function generate() {
     let block = current.blocks.find(item => item.type === 'text');
     if (!block) {
       block = { id: makeId(), type: 'text', span: 12, title: '', text: '', html: '' };
-      current.blocks.push(block);
+      appendBlock(block, current);
     }
     block.text = result.body;
     block.html = String(result.body || '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])).replaceAll('\n', '<br>');
@@ -863,10 +916,37 @@ async function saveInfo() {
   }
 }
 
+/* ---------- 分类模板联动 ---------- */
+const templateInfo = ref(null);
+const templateLoading = ref(false);
+const templateSyncVisible = ref(false);
+async function loadTemplate() {
+  if (!report.value?.category_id) return false;
+  templateLoading.value = true;
+  try { templateInfo.value = await api(`report-template/${report.value.id}`); return true; }
+  catch (error) { ElMessage.error(error.message || '读取分类模板失败'); return false; }
+  finally { templateLoading.value = false; }
+}
+watch(() => report.value?.id, () => { templateInfo.value = null; if (report.value?.category_id && creator.value && editable.value) loadTemplate(); }, { immediate: true });
+async function openTemplateSync() {
+  if (dirty.value) return ElMessage.warning('请先保存当前章节，再同步分类配置');
+  if (await loadTemplate()) templateSyncVisible.value = true;
+}
+async function syncTemplate() {
+  if (!templateInfo.value?.can_sync || busy.value) return;
+  busy.value = true;
+  try {
+    const result = await api('report-template-sync', { id: report.value.id, version: templateInfo.value.report_version, token: templateInfo.value.token });
+    await refresh(); initDraft(true); templateSyncVisible.value = false; await loadTemplate();
+    ElMessage.success(result.changed === false ? '当前研报已是最新模板' : '已同步分类章节与审批，正文已保留');
+  } catch (error) { ElMessage.error(error.message || '同步失败，请重新预览后重试'); }
+  finally { busy.value = false; }
+}
+
 /* ---------- 弹窗：章节设置 ---------- */
 
 const chapterVisible = ref(false);
-const chapterForm = reactive({ index: 0, title: '', editors: [], tags: '', commodity_ids: [] });
+const chapterForm = reactive({ index: 0, title: '', group: '', label: '', type: '', required: false, default: '', editors: [], commodity_ids: [] });
 const chapterPeople = computed(() => [report.value?.author, ...(meta.value?.collaborators || [])].filter(Boolean));
 
 function openChapterSettings(index) {
@@ -874,8 +954,13 @@ function openChapterSettings(index) {
   chapterIndex.value = index;
   chapterForm.index = index;
   chapterForm.title = item.title || '';
+  const definition = paperCfg.value.sections?.find(node => node.id === item.id) || {};
+  chapterForm.group = item.group ?? definition.group ?? '';
+  chapterForm.label = item.label ?? definition.label ?? '';
+  chapterForm.type = item.type ?? definition.type ?? '';
+  chapterForm.required = Boolean(item.required);
+  chapterForm.default = definition.default || '';
   chapterForm.editors = [...(item.editors || [])];
-  chapterForm.tags = (item.tags || []).join('，');
   chapterForm.commodity_ids = [...(item.commodity_ids || [])];
   chapterVisible.value = true;
 }
@@ -884,8 +969,8 @@ async function saveChapterSettings() {
   chapterIndex.value = chapterForm.index;
   await chapterStructure('edit', {
     title: chapterForm.title,
+    group: chapterForm.group, label: chapterForm.label, type: chapterForm.type, required: chapterForm.required, default: chapterForm.default,
     editors: chapterForm.editors,
-    tags: chapterForm.tags.split(/[，,]/).map(text => text.trim()).filter(Boolean),
     commodity_ids: chapterForm.commodity_ids,
   });
 }
@@ -1006,3 +1091,12 @@ async function openHistory() {
   }
 }
 </script>
+
+<style scoped>
+.chapter-template { padding: 12px; border-bottom: 1px solid var(--el-border-color-lighter); font-size: 12px; }
+.chapter-template span, .chapter-template small { display: block; overflow-wrap: anywhere; margin-bottom: 5px; }
+.chapter-template small { color: var(--el-text-color-secondary); }
+.chapter-workflow { padding: 12px; background: var(--el-fill-color-light); border-radius: 6px; }
+.chapter-workflow h4 { margin: 0 0 8px; }
+.chapter-workflow ol { margin: 10px 0; padding-left: 20px; line-height: 1.9; }
+</style>

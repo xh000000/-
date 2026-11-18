@@ -10,7 +10,7 @@
 分页在浏览器端按 A4 实测高度切页（本文件内嵌脚本），因此预览与打印看到的是同一份排版。
 文本内容在保存时已通过 richtext 白名单清洗，此处只做结构与样式拼装。
 """
-import json, re
+import json, re, math
 from html import escape
 
 SANS = '"Microsoft YaHei","PingFang SC","Source Han Sans SC","Noto Sans CJK SC",sans-serif'
@@ -209,7 +209,7 @@ def _cm_class(html):
 
 
 def _chart(block):
-    rows = [r for r in (block.get('data') or []) if isinstance(r.get('value'), (int, float))]
+    rows = [r for r in (block.get('data') or []) if isinstance(r.get('value'), (int, float)) and math.isfinite(r['value'])]
     if not rows:
         return '<p class="empty">数据引用待保存后生成图表</p>'
     rows = rows[-60:]
@@ -219,16 +219,18 @@ def _chart(block):
         low -= 1
         high += 1
     step = 480 / max(1, len(rows) - 1)
-    points = ' '.join('%.1f,%.1f' % (50 + i * step, 175 - (v - low) / (high - low) * 135) for i, v in enumerate(values))
-    return ('<figure><svg viewBox="0 0 580 215" width="100%" style="max-width:580px" role="img">'
+    coords = [(290 if len(rows) == 1 else 50 + i * step, 175 - (v - low) / (high - low) * 135) for i, v in enumerate(values)]
+    points = ' '.join('%.1f,%.1f' % point for point in coords)
+    marker = '<circle cx="%.1f" cy="%.1f" r="4" fill="#014099"></circle>' % coords[0] if len(rows) == 1 else ''
+    return ('<figure><svg viewBox="0 0 580 215" width="100%%" style="max-width:580px" role="img">'
             '<line x1="50" y1="175" x2="530" y2="175" stroke="#cfd8e0"></line>'
             '<line x1="50" y1="40" x2="50" y2="175" stroke="#cfd8e0"></line>'
             '<text x="4" y="45" font-size="10" fill="#9aa7b2">%s</text>'
             '<text x="4" y="178" font-size="10" fill="#9aa7b2">%s</text>'
-            '<polyline points="%s" fill="none" stroke="#014099" stroke-width="2.4"></polyline>'
+            '<polyline points="%s" fill="none" stroke="#014099" stroke-width="2.4"></polyline>%s'
             '<text x="50" y="198" font-size="10" fill="#9aa7b2">%s</text>'
             '<text x="470" y="198" font-size="10" fill="#9aa7b2">%s</text></svg></figure>'
-            % (escape('%.2f' % high), escape('%.2f' % low), points,
+            % (escape('%.2f' % high), escape('%.2f' % low), points, marker,
                escape(str(rows[0].get('date', ''))), escape(str(rows[-1].get('date', '')))))
 
 

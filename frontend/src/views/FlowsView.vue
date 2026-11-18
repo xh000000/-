@@ -1,12 +1,15 @@
 <template>
   <div>
     <PageHead
-      title="审批流配置"
+      title="审批流设置"
       description="为指定分类配置多节点审批流；新建报告时按分类匹配并快照，未匹配的分类沿用分类自带的审批节点。"
     >
       <el-button type="primary" @click="openDialog(null)">添加审批流</el-button>
     </PageHead>
 
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 18px"
+      title="研报审批规则"
+      description="支持或签、会签和依次审批；审批流必须包含合规审核节点。新建研报时保存审批流快照；作者不能审核或发布自己的报告。" />
     <div class="panel">
       <el-table :data="flows" empty-text="暂无审批流">
         <el-table-column label="名称" min-width="140" prop="name" />
@@ -95,7 +98,7 @@
           </el-form-item>
         </div>
         <el-form-item label="指定审批人" label-width="86px">
-          <el-select v-model="node.users" multiple placeholder="留空表示该角色任一账号可签" style="width: 100%">
+          <el-select v-model="node.users" multiple placeholder="留空表示该角色任一启用账号可签" style="width: 100%">
             <el-option v-for="one in roleUsers(node.role)" :key="one.id" :label="one.name" :value="one.id" />
           </el-select>
         </el-form-item>
@@ -125,7 +128,7 @@ const form = reactive({ id: null, name: '', category_ids: [], nodes: [], enabled
 
 const leafCategories = computed(() => categoryTree.value.filter(item => !item.folder));
 const categoryName = id => categoryTree.value.find(item => item.id === id)?.name || '#' + id;
-const roleUsers = role => users.value.filter(item => item.role === role);
+const roleUsers = role => users.value.filter(item => item.role === role && item.enabled);
 
 function openDialog(row) {
   form.id = row?.id ?? null;

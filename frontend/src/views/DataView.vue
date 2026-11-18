@@ -1,25 +1,34 @@
 <template>
-  <div>
+  <div class="data-entry-page">
     <PageHead
-      title="手工数据录入"
-      description="同花顺 / Wind 等数据来源在这里取数入库；配好接口与计划后服务端按时自动同步，CSV 仅作备用通道。"
+      title="数据录入"
+      description="管理数据源，配置接口、账号凭据和同步计划，也可通过 CSV 导入数据。"
     >
-      <el-button @click="router.push('/data/indicators')">指标查询</el-button>
+      <el-button v-if="canConfig" type="primary" @click="openSource(null)">新增数据源</el-button>
       <el-button @click="openCsv">导入 CSV</el-button>
+      <el-button @click="openSyncRecords">同步记录</el-button>
       <el-button :loading="loading" @click="load">刷新</el-button>
     </PageHead>
 
+    <div class="entry-summary">
+      <div><span>数据源</span><strong>{{ sources.length }}<small>个</small></strong><p>统一管理数据接入通道</p></div>
+      <div><span>已启用</span><strong>{{ sources.filter(item => item.enabled).length }}<small>个</small></strong><p>当前可用的数据来源</p></div>
+      <div><span>累计数据点</span><strong>{{ sources.reduce((sum, item) => sum + Number(item.rows || 0), 0).toLocaleString() }}</strong><p>已同步入库的数据记录</p></div>
+      <div><span>同步配置</span><strong>{{ configs.length }}<small>项</small></strong><p>接口与自动执行计划</p></div>
+    </div>
+    <div class="entry-section-head"><div><h3>数据源管理</h3><p class="caption">先添加数据源，再配置接口与同步计划</p></div><el-tag effect="plain">{{ sources.length }} 个数据源</el-tag></div>
     <div class="card-grid src-grid">
-      <div v-for="source in sources" :key="source.key" class="panel src-card">
+      <div v-for="source in sources" :key="source.key" class="panel src-card" :class="{ 'source-clickable': canConfig }" @click="canConfig && openSourceSettings(source)">
+        <button v-if="canConfig" class="source-config-link" type="button" @click.stop="openSourceSettings(source)" :aria-label="`配置${source.name}`">查看配置 →</button>
         <div class="src-head">
           <div>
-            <h3>{{ source.name }}</h3>
+            <div class="source-identity"><span class="source-avatar">{{ source.name?.slice(0, 1) }}</span><h3>{{ source.name }}</h3></div>
             <p class="caption">{{ source.product || '—' }}</p>
           </div>
           <div class="row" style="gap: 6px">
             <el-tag v-if="!source.enabled" size="small" type="info" effect="plain" disable-transitions>已停用</el-tag>
-            <el-tag :type="source.rows ? 'success' : 'info'" size="small" disable-transitions>
-              {{ source.rows ? '已同步' : '待同步' }}
+            <el-tag :type="sourceStatus(source).type" size="small" disable-transitions>
+              {{ sourceStatus(source).label }}
             </el-tag>
           </div>
         </div>
@@ -29,87 +38,19 @@
           <span>最新 <b>{{ source.latest || '—' }}</b></span>
         </div>
         <p class="caption src-channel">{{ source.channel || '未填写取数通道说明' }}</p>
-        <div class="row" style="margin-top: 12px">
-          <el-button type="primary" size="small" :disabled="!canSync || !source.enabled" @click="openSync(source)">
+        <div class="source-actions">
+          <el-button type="primary" size="small" :disabled="!canSync || !source.enabled || ['ifind', 'wind'].includes(source.key) || syncingSource === source.key" :loading="syncingSource === source.key" @click.stop="openSync(source)">
             同步数据
           </el-button>
-          <el-button v-if="canConfig" link size="small" @click="openSource(source)">编辑</el-button>
-          <span class="tiny">上次同步 {{ localTime(source.last_sync) }}</span>
+          </div><div class="source-last-sync">上次同步 <span>{{ localTime(source.last_sync) }}</span>
         </div>
       </div>
-
-      <button v-if="canConfig" type="button" class="src-add" @click="openSource(null)">
-        <span>+</span>
-        添加数据来源
-      </button>
     </div>
 
-    <div v-if="canConfig" class="panel">
-      <div class="panel-header">
-        <h3>取数配置</h3>
-        <div class="row">
-          <span class="hint">配好接口与计划，服务端自己取数入库</span>
-          <el-button type="primary" size="small" @click="openConfig(null)">新建配置</el-button>
-        </div>
-      </div>
-      <el-table :data="configs" empty-text="还没有取数配置" size="small">
-        <el-table-column prop="name" label="名称" min-width="150">
-          <template #default="{ row }">
-            <span class="ellipsis" style="display: block" :title="row.name">{{ row.name }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="来源" width="96">
-          <template #default="{ row }">{{ row.source_name }}</template>
-        </el-table-column>
-        <el-table-column label="方式" width="132">
-          <template #default="{ row }">
-            <span class="tiny">{{ row.kind_label }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="接口" min-width="180">
-          <template #default="{ row }">
-            <span class="tiny ellipsis" style="display: block" :title="row.base_url">{{ row.base_url }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="范围" min-width="140">
-          <template #default="{ row }">
-            <span class="tiny ellipsis" style="display: block" :title="configScope(row)">{{ configScope(row) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="计划" width="118">
-          <template #default="{ row }">
-            <span class="tiny">{{ planText(row) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="上次执行" width="150">
-          <template #default="{ row }">
-            <span class="tiny">{{ row.last_run || '—' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="82">
-          <template #default="{ row }">
-            <el-tag :type="configTag(row)" size="small" disable-transitions>{{ row.last_status }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="236">
-          <template #default="{ row }">
-            <el-button link type="primary" size="small" :loading="runningId === row.id" @click="runConfig(row)">
-              执行
-            </el-button>
-            <el-button link size="small" :loading="testingId === row.id" @click="testConfig(row)">试连</el-button>
-            <el-button link size="small" @click="openConfig(row)">编辑</el-button>
-            <el-button link type="danger" size="small" @click="removeConfig(row)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-      <p class="caption" style="margin-top: 10px">
-        凭据只保存在服务端数据库，接口只回传掩码；执行结果会写进下方同步记录，失败原因也一并记录。
-      </p>
-    </div>
 
-    <div class="panel">
+    <el-dialog v-model="syncRecordsVisible" title="同步记录" width="1200px" top="6vh" class="sync-records-dialog">
       <div class="panel-header">
-        <h3>同步记录</h3>
+        <span class="caption">查看数据同步结果，支持按来源、状态和时间筛选</span>
         <span class="hint">共 {{ jobTotal }} 条</span>
       </div>
 
@@ -143,7 +84,7 @@
         <el-button @click="resetJobFilter">重置</el-button>
       </div>
 
-      <el-table :data="jobs" empty-text="没有匹配的同步记录" size="small">
+      <el-table v-loading="jobsLoading" max-height="440" :data="jobs" empty-text="没有匹配的同步记录" size="small">
         <el-table-column prop="id" label="编号" width="62" />
         <el-table-column label="来源" width="92">
           <template #default="{ row }">{{ row.source_name }}</template>
@@ -189,46 +130,88 @@
           @current-change="queryJobs"
         />
       </div>
-    </div>
+    </el-dialog>
 
-    <el-dialog v-model="syncVisible" :title="`从 ${activeSource?.name || ''} 同步`" width="540px">
-      <el-form label-width="72px" label-position="left" @submit.prevent>
-        <el-form-item label="范围">
-          <el-select
-            v-model="scopeItems"
-            multiple
-            filterable
-            collapse-tags
-            collapse-tags-tooltip
-            :placeholder="scopePlaceholder"
-            style="width: 100%"
-          >
-            <el-option v-for="item in scopeOptions" :key="item" :label="item" :value="item" />
+    <el-drawer v-model="sourceSettingsVisible" :title="`${settingsSource?.name || ''} · 数据源配置`" size="90%">
+      <div class="panel-header"><p class="caption">管理此数据源的接口连接和同步计划</p><el-button @click="openSource(settingsSource)">编辑数据源</el-button></div>
+      <div class="panel-header">
+        <div><h3>接口与同步配置</h3><p class="caption">管理连接凭据、取数范围和执行计划</p></div>
+        <div class="row">
+          <span class="hint">支持手动、每日或每周执行</span>
+          <el-button type="primary" size="small" @click="openConfig(null, settingsSource)">新建配置</el-button>
+        </div>
+      </div>
+      <el-table :data="sourceConfigs" empty-text="还没有取数配置" size="small">
+        <el-table-column prop="name" label="名称" min-width="150">
+          <template #default="{ row }">
+            <span class="ellipsis" style="display: block" :title="row.name">{{ row.name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="来源" width="96">
+          <template #default="{ row }">{{ row.source_name }}</template>
+        </el-table-column>
+        <el-table-column label="方式" width="132">
+          <template #default="{ row }">
+            <span class="tiny">{{ row.kind_label }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="接口" min-width="180">
+          <template #default="{ row }">
+            <span class="tiny ellipsis" style="display: block" :title="row.base_url">{{ row.base_url }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="范围" min-width="140">
+          <template #default="{ row }">
+            <span class="tiny ellipsis" style="display: block" :title="configScope(row)">{{ configScope(row) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="计划" width="118">
+          <template #default="{ row }">
+            <span class="tiny">{{ planText(row) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="上次执行" width="150">
+          <template #default="{ row }">
+            <span class="tiny">{{ row.last_run || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="82">
+          <template #default="{ row }">
+            <el-tag :type="configTag(row)" size="small" disable-transitions>{{ row.last_status }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="执行说明" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.last_message || '尚未执行' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="236" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" :loading="runningId === row.id" @click="runConfig(row)">
+              执行
+            </el-button>
+            <el-button link size="small" :loading="testingId === row.id" @click="testConfig(row)">试连</el-button>
+            <el-button link size="small" @click="openConfig(row)">编辑</el-button>
+            <el-button link type="danger" size="small" @click="removeConfig(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p class="caption" style="margin-top: 10px">
+        凭据只保存在服务端数据库，接口只回传掩码；执行结果可通过顶部「同步记录」查看，失败原因也一并记录。
+      </p>
+    </el-drawer>
+
+    <el-dialog v-model="syncVisible" :title="`${activeSource?.name || ''} · 同步数据`" width="540px">
+      <el-alert type="info" :closable="false" show-icon title="立即连接数据接口，按所选配置获取并入库；不会仅登记待执行任务。" />
+      <el-form label-width="90px" style="margin-top: 20px">
+        <el-form-item label="同步配置">
+          <el-select v-model="syncConfigId" placeholder="选择配置" style="width: 100%">
+            <el-option v-for="item in activeSyncConfigs" :key="item.id" :label="item.name" :value="item.id" />
           </el-select>
         </el-form-item>
-        <el-form-item label="指标">
-          <el-checkbox-group v-model="scopeMetrics">
-            <el-checkbox v-for="metric in metrics" :key="metric.key" :label="metric.key">
-              {{ metric.label }}
-            </el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-        <el-form-item label="区间">
-          <el-radio-group v-model="scopeDays">
-            <el-radio-button :label="5">5 个交易日</el-radio-button>
-            <el-radio-button :label="10">10 个</el-radio-button>
-            <el-radio-button :label="20">20 个</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
       </el-form>
-      <el-alert type="info" :closable="false" show-icon>
-        <template #title>
-          这里登记的是待执行作业，由已授权通道回填；若希望服务端自己按时取数，请在上方「取数配置」里配接口与计划。
-        </template>
-      </el-alert>
+      <p v-if="selectedSyncConfig" class="caption">范围：{{ configScope(selectedSyncConfig) }}</p>
       <template #footer>
         <el-button @click="syncVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitSync">登记同步</el-button>
+        <el-button type="primary" :loading="submitting" :disabled="!syncConfigId" @click="submitSync">立即同步</el-button>
       </template>
     </el-dialog>
 
@@ -250,7 +233,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="sourceVisible" :title="sourceForm.id ? '编辑数据来源' : '添加数据来源'" width="520px">
+    <el-dialog v-model="sourceVisible" :title="sourceForm.id ? '编辑数据来源' : '新增数据源'" width="520px">
       <el-form label-width="96px" label-position="left" @submit.prevent>
         <el-form-item label="名称">
           <el-input v-model="sourceForm.name" maxlength="30" placeholder="入库标签，如：同花顺 / 卓创资讯" />
@@ -317,6 +300,7 @@
             <el-option v-for="item in sources" :key="item.key" :label="item.name" :value="item.key" />
           </el-select>
         </el-form-item>
+        <el-alert v-if="configForm.kind === 'eastmoney_snapshot'" type="info" :closable="false" title="最新行情快照：每次同步更新行情当天的数据，不提供历史日线或收盘价。" style="margin-bottom: 16px" />
         <el-form-item label="取数方式">
           <el-select v-model="configForm.kind" style="width: 100%">
             <el-option v-for="item in kinds" :key="item.key" :label="item.label" :value="item.key" />
@@ -354,12 +338,12 @@
         </el-form-item>
         <el-form-item label="指标">
           <el-checkbox-group v-model="configForm.metrics">
-            <el-checkbox v-for="metric in metrics" :key="metric.key" :label="metric.key">
+            <el-checkbox v-for="metric in configMetrics" :key="metric.key" :label="metric.key">
               {{ metric.label }}
             </el-checkbox>
           </el-checkbox-group>
         </el-form-item>
-        <el-form-item label="区间">
+        <el-form-item v-if="configForm.kind !== 'eastmoney_snapshot'" label="区间">
           <el-radio-group v-model="configForm.days">
             <el-radio-button :label="5">5 个交易日</el-radio-button>
             <el-radio-button :label="10">10 个</el-radio-button>
@@ -433,7 +417,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="jobVisible" title="同步记录详情" width="560px">
+    <el-dialog v-model="jobVisible" append-to-body title="同步记录详情" width="560px">
       <div v-if="activeJob" class="job-detail">
         <div class="job-detail-row"><span>编号</span><b>#{{ activeJob.id }}</b></div>
         <div class="job-detail-row"><span>来源</span><b>{{ activeJob.source_name }}</b></div>
@@ -459,7 +443,6 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue';
-import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import PageHead from '../components/PageHead.vue';
 import { api } from '../api';
@@ -467,9 +450,22 @@ import { commodities, refresh } from '../store/session';
 import { localTime } from '../utils/format';
 
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
-const router = useRouter();
 
 const sources = ref([]);
+const sourceSettingsVisible = ref(false);
+const settingsSource = ref(null);
+const sourceConfigs = computed(() => configs.value.filter(item => item.source === settingsSource.value?.key));
+function sourceStatus(source) {
+  if (!source.enabled) return { label: '已停用', type: 'info' };
+  if (['ifind', 'wind'].includes(source.key)) return { label: '暂不取数', type: 'info' };
+  const related = configs.value.filter(item => item.source === source.key);
+  if (related.some(item => item.last_status === '失败')) return { label: '同步失败', type: 'danger' };
+  return { label: source.rows ? '已同步' : '待同步', type: source.rows ? 'success' : 'info' };
+}
+function openSourceSettings(source) {
+  settingsSource.value = source;
+  sourceSettingsVisible.value = true;
+}
 const metrics = ref([]);
 const kinds = ref([]);
 const freqs = ref([]);
@@ -481,6 +477,14 @@ const loading = ref(false);
 const syncVisible = ref(false);
 const submitting = ref(false);
 const activeSource = ref(null);
+const syncingSource = ref('');
+const syncConfigId = ref(null);
+const activeSyncConfigs = computed(() => configs.value.filter(item => item.source === activeSource.value?.key && item.enabled));
+const selectedSyncConfig = computed(() => activeSyncConfigs.value.find(item => item.id === syncConfigId.value));
+const configMetrics = computed(() => configForm.kind === 'eastmoney_snapshot'
+  ? metrics.value.filter(item => ['index_last', 'volume'].includes(item.key))
+  : ['eastmoney_index', 'sina_index'].includes(configForm.kind)
+    ? metrics.value.filter(item => ['index_close', 'volume'].includes(item.key)) : metrics.value);
 const scopeItems = ref([]);
 const scopeMetrics = ref([]);
 const scopeDays = ref(10);
@@ -511,6 +515,12 @@ const jobPage = ref(1);
 const jobSize = ref(20);
 const jobStatuses = ref(['待执行', '执行中', '已完成', '失败']);
 const jobFilter = reactive({ source: '', status: '', q: '', range: null });
+const syncRecordsVisible = ref(false);
+const jobsLoading = ref(false);
+function openSyncRecords() {
+  syncRecordsVisible.value = true;
+  queryJobs(1);
+}
 const jobVisible = ref(false);
 const activeJob = ref(null);
 
@@ -557,7 +567,7 @@ function configScope(row) {
   const items = scope.items || [];
   const labels = (scope.metrics || []).map(key => metrics.value.find(m => m.key === key)?.label || key);
   const head = items.length > 3 ? `${items.slice(0, 3).join('、')} 等 ${items.length} 个` : items.join('、');
-  return `${head || '—'} · ${labels.join('/') || '—'} · 近 ${scope.days || '—'} 日`;
+  return `${head || '—'} · ${labels.join('/') || '—'} · ${row.kind === 'eastmoney_snapshot' ? '最新快照' : `近 ${scope.days || '—'} 日`}`;
 }
 
 function planText(row) {
@@ -595,6 +605,7 @@ async function load() {
 }
 
 async function queryJobs(page = 1) {
+  jobsLoading.value = true;
   jobPage.value = page;
   const params = new URLSearchParams({ page: String(page), size: String(jobSize.value) });
   if (jobFilter.source) params.set('source', jobFilter.source);
@@ -609,6 +620,8 @@ async function queryJobs(page = 1) {
     jobStatuses.value = result.statuses || jobStatuses.value;
   } catch (error) {
     ElMessage.error(error.message || '读取同步记录失败');
+  } finally {
+    jobsLoading.value = false;
   }
 }
 
@@ -627,33 +640,36 @@ function openJob(row) {
 
 /* ---------- 页面登记同步（由已授权通道回填） ---------- */
 function openSync(source) {
+  if (['ifind', 'wind'].includes(source.key)) {
+    ElMessage.info('此数据源暂不取数，可点击卡片维护配置');
+    return;
+  }
   activeSource.value = source;
-  scopeItems.value = source.scope_mode === 'custom' && source.scope_items?.length
-    ? source.scope_items.slice(0, 1)
-    : leafCommodities.value.slice(0, 6);
-  scopeMetrics.value = ['close', 'settle', 'volume', 'open_interest'];
-  scopeDays.value = 10;
+  syncConfigId.value = activeSyncConfigs.value[0]?.id || null;
+  if (!syncConfigId.value) {
+    ElMessage.info('请先为此数据源创建并启用接口配置');
+    if (canConfig.value) openSourceSettings(source);
+    return;
+  }
   syncVisible.value = true;
 }
 
 async function submitSync() {
-  if (!scopeItems.value.length) return ElMessage.warning('请选择至少一个品种或指标');
-  if (!scopeMetrics.value.length) return ElMessage.warning('请选择至少一个指标');
+  if (!selectedSyncConfig.value) return ElMessage.warning('请选择启用的同步配置');
   submitting.value = true;
+  syncingSource.value = activeSource.value.key;
   try {
-    const result = await api('data/jobs', {
-      source: activeSource.value?.key,
-      items: scopeItems.value,
-      metrics: scopeMetrics.value,
-      days: scopeDays.value,
-    });
-    syncVisible.value = false;
-    await queryJobs(1);
-    ElMessage.success(`已登记同步作业 #${result.job?.id}，取数回填后自动入库`);
+    const result = await api('data/configs/run', { id: syncConfigId.value });
+    if (result.ok) {
+      ElMessage.success(result.message);
+      syncVisible.value = false;
+    } else ElMessage.error(result.message || '同步失败');
+    await Promise.all([load(), refresh()]);
   } catch (error) {
-    ElMessage.error(error.message || '登记同步作业失败');
+    ElMessage.error(error.message || '同步失败');
   } finally {
     submitting.value = false;
+    syncingSource.value = '';
   }
 }
 
@@ -714,7 +730,7 @@ async function removeSource() {
 }
 
 /* ---------- 取数配置 ---------- */
-function openConfig(config) {
+function openConfig(config, source = null) {
   testResult.value = null;
   Object.assign(configForm, emptyConfig());
   if (config) {
@@ -735,9 +751,18 @@ function openConfig(config) {
       field_map: options.field_map && Object.keys(options.field_map).length
         ? JSON.stringify(options.field_map) : '',
     });
-  } else if (sources.value.length) {
-    configForm.source = sources.value[0].key;
-    configForm.name = `${sources.value[0].name} 自动同步`;
+  } else if (source || sources.value.length) {
+    const selected = source || sources.value[0];
+    configForm.source = selected.key;
+    configForm.name = `${selected.name} 自动同步`;
+    if (['eastmoney', 'sina'].includes(selected.key)) {
+      configForm.kind = selected.key === 'eastmoney' ? 'eastmoney_snapshot' : 'sina_index';
+      configForm.base_url = selected.key === 'eastmoney'
+        ? 'https://push2.eastmoney.com/api/qt/stock/get'
+        : 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData';
+      configForm.items = [...(selected.scope_items || [])];
+      configForm.metrics = [selected.key === 'eastmoney' ? 'index_last' : 'index_close', 'volume'];
+    }
   }
   configVisible.value = true;
 }
@@ -895,3 +920,41 @@ async function submit() {
 
 onMounted(load);
 </script>
+
+<style scoped>
+.sync-records-dialog { max-width: calc(100vw - 32px); }
+.data-entry-page { --entry-border: #e6ebf2; }
+.entry-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 28px; }
+.entry-summary > div { padding: 20px 22px; border: 1px solid var(--entry-border); border-radius: 12px; background: linear-gradient(135deg, #fff, #f8faff); }
+.entry-summary span { font-size: 13px; color: #64748b; }
+.entry-summary strong { display: block; margin: 10px 0 8px; font-size: 30px; line-height: 1.2; color: #183153; font-variant-numeric: tabular-nums; }
+.entry-summary small { margin-left: 7px; font-size: 13px; font-weight: 400; color: #94a3b8; }
+.entry-summary p { margin: 0; color: #94a3b8; font-size: 12px; }
+.entry-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.entry-section-head h3 { margin: 0 0 6px; font-size: 16px; }
+.src-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; margin-bottom: 28px; }
+.src-card { border: 1px solid var(--entry-border); border-radius: 12px; padding: 20px; transition: box-shadow .2s, border-color .2s; }
+.source-clickable { cursor: pointer; }
+.source-config-link { align-self: flex-end; border: 0; background: none; color: #3265b0; cursor: pointer; font: inherit; font-size: 12px; margin-bottom: 12px; }
+.source-clickable:focus-within { outline: 2px solid #b9cdee; outline-offset: 2px; }
+.src-card:hover { border-color: #b9cdee; box-shadow: 0 6px 22px #1831530a; }
+.source-identity { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.source-avatar { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: #3265b0; background: #edf3ff; font-size: 16px; font-weight: 600; }
+.src-facts { display: grid; grid-template-columns: 1fr 1fr; padding: 14px 0; margin: 8px 0; border-top: 1px solid #f0f3f8; border-bottom: 1px solid #f0f3f8; }
+.src-facts span:last-child { grid-column: 1 / -1; }
+.source-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.source-actions :deep(.el-button + .el-button) { margin-left: 0; }
+.source-last-sync { display: flex; justify-content: space-between; gap: 8px; margin-top: 16px; color: #94a3b8; font-size: 12px; }
+.src-add { flex-direction: column; min-height: 250px; border-radius: 12px; background: #f8faff; gap: 12px; }
+.src-add > span { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; background: #eaf1fc; color: #4775b8; font-size: 28px; }
+.src-add b { font-size: 14px; font-weight: 500; }
+.src-add small { color: #94a3b8; }
+.data-entry-page > .panel { padding: 22px; border-radius: 12px; border: 1px solid var(--entry-border); margin-bottom: 22px; }
+.job-filter { padding: 14px; border-radius: 8px; background: #f8fafc; display: flex; flex-wrap: wrap; gap: 10px; }
+:deep(.el-table th.el-table__cell) { background: #f8fafc; color: #64748b; }
+:deep(.el-table .el-table__cell) { padding-top: 13px; padding-bottom: 13px; }
+:deep(.page-head) { align-items: flex-start; gap: 20px; margin-bottom: 24px; }
+:deep(.page-head > .row) { flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 1100px) { .entry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } :deep(.page-head) { flex-wrap: wrap; } }
+@media (max-width: 600px) { .entry-summary { gap: 10px; } .entry-summary > div { padding: 14px; } .entry-summary strong { font-size: 25px; } .src-grid { grid-template-columns: minmax(0, 1fr); } .data-entry-page > .panel { padding: 14px; } :deep(.el-dialog) { max-width: calc(100vw - 24px); } }
+</style>

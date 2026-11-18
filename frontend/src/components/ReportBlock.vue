@@ -43,6 +43,7 @@
         <text x="4" y="45" font-size="10" fill="#909399">{{ chart.high }}</text>
         <text x="4" y="178" font-size="10" fill="#909399">{{ chart.low }}</text>
         <polyline :points="chart.points" fill="none" stroke="#409EFF" stroke-width="2.5" />
+        <circle v-if="chart.dots.length === 1" :cx="chart.dots[0].x" :cy="chart.dots[0].y" r="4" fill="#409EFF"><title>{{ chart.first }}：{{ chart.dots[0].value }}</title></circle>
         <text x="50" y="198" font-size="10" fill="#909399">{{ chart.first }}</text>
         <text x="466" y="198" font-size="10" fill="#909399">{{ chart.last }}</text>
       </svg>
@@ -51,10 +52,10 @@
         <el-table-column prop="value" :label="block.indicator" />
         <el-table-column prop="unit" label="单位" width="100" />
       </el-table>
-      <p v-else class="empty-hint">保存后由服务端生成数据快照</p>
+      <p v-else class="empty-hint">暂无可展示数据，请刷新数据或重新选择指标</p>
       <p class="data-caption">
-        来源：{{ block.source }} · {{ block.indicator }} · 快照 {{ (block.data || []).length }} 条 ·
-        刷新于 {{ block.refreshed_at || '待保存' }}
+        来源：{{ block.source }} · {{ block.indicator }} · {{ (block.data || []).length }} 条 ·
+        {{ block.preview ? '尚未保存' : `更新于 ${block.refreshed_at || '待更新'}` }}
       </p>
     </template>
   </article>
@@ -91,7 +92,7 @@ const freeStyle = computed(() =>
 );
 
 const chart = computed(() => {
-  const rows = (props.block.data || []).slice(-60);
+  const rows = (props.block.data || []).filter(row => row.value !== null && row.value !== undefined && row.value !== '' && Number.isFinite(Number(row.value))).slice(-60);
   if (!rows.length) return {};
   const values = rows.map(row => Number(row.value));
   let low = Math.min(...values);
@@ -100,11 +101,10 @@ const chart = computed(() => {
     low -= 1;
     high += 1;
   }
-  const points = rows
-    .map((row, i) => `${50 + (i * 480) / Math.max(1, rows.length - 1)},${175 - ((row.value - low) / (high - low)) * 135}`)
-    .join(' ');
+  const dots = rows.map((row, i) => ({ x: rows.length === 1 ? 290 : 50 + (i * 480) / (rows.length - 1), y: 175 - ((Number(row.value) - low) / (high - low)) * 135, value: row.value }));
+  const points = dots.map(point => `${point.x},${point.y}`).join(' ');
   return {
-    points,
+    points, dots,
     low: low.toFixed(2),
     high: high.toFixed(2),
     first: rows[0].date,

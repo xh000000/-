@@ -2,3 +2,5 @@
 fastapi==0.163.1
 uvicorn==0.54.0
 SQLAlchemy==2.1.9
+
+truststore==0.10.5

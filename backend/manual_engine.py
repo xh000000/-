@@ -107,7 +107,7 @@ def tree(s):
     return rows
 
 def catalogs(s):
-    return {'category_tree':tree(s),'authors':[x.to_dict() for x in s.execute(select(Author).order_by(Author.id)).scalars()],'commodities':[x.to_dict() for x in s.execute(select(Commodity).order_by(Commodity.id)).scalars()],'members':[dict(r._mapping) for r in s.execute(select(User.id,User.name,User.role).order_by(User.id))]}
+    return {'category_tree':tree(s),'authors':[x.to_dict() for x in s.execute(select(Author).order_by(Author.id)).scalars()],'commodities':[x.to_dict() for x in s.execute(select(Commodity).order_by(Commodity.id)).scalars()],'members':[dict(r._mapping) for r in s.execute(select(User.id,User.name,User.role,User.enabled).order_by(User.id))]}
 
 def meta(r):return json.loads(r['metadata']) if r['metadata'] else None
 def editable(r):return r['status'] in ['草稿','已退回']
@@ -135,6 +135,31 @@ def chapter_clean(s,r,doc,section,blocks,refresh=False):
     cfg=json.loads(r['config_snapshot']);cfg['sections']=[{'id':section['id'],'title':section['title'],'required':section['required'],'group':section.get('group',''),'label':section.get('label','')}]
     test={'layout':doc['layout'],'sections':[{'id':section['id'],'blocks':blocks}]}
     return e.validate_document(s,test,cfg,{'sections':[section]},refresh)['sections'][0]['blocks']
+
+def align_section_config(config, doc):
+    """Keep current-report chapter definitions aligned with its editable document."""
+    previous={item['id']:item for item in config.get('sections',[])}
+    fields={'title':'','group':'','label':'','type':'','required':False,'commodity_ids':[]}
+    config['sections']=[{**previous.get(section['id'],{}),'id':section['id'],
+        **{key:section.get(key,previous.get(section['id'],{}).get(key,default)) for key,default in fields.items()},
+        'default':previous.get(section['id'],{}).get('default','')} for section in doc['sections']]
+
+
+def renumber_chapters(doc):
+    """Reorder ordinary numeric chapter labels within each group; custom labels stay intact."""
+    groups={}
+    for section in doc['sections']:groups.setdefault(section.get('group',''),[]).append(section)
+    for sections in groups.values():
+        labels=[str(section.get('label') or '').strip() for section in sections]
+        numeric=[label for label in labels if re.fullmatch(r'[0-9]{1,3}',label)]
+        if not numeric or any(label and not re.fullmatch(r'[0-9]{1,3}',label) for label in labels):continue
+        width=max(len(label) for label in numeric)
+        for index,section in enumerate(sections,1):
+            label=str(index).zfill(width)
+            if section.get('label')!=label:
+                section['label']=label;section['revision']=section.get('revision',0)+1
+                if section.get('state')=='已提交':section['state']='未提交'
+
 
 def save_doc(s,r,u,doc,stamp,snapshot,event,action,note='',metadata=None,title=None):
     md=metadata or meta(r);cfg=json.loads(r['config_snapshot'])
@@ -238,13 +263,13 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         return None
     if path=='/api/reports' and d.get('manual'):
         if u['role'] not in ['admin','researcher']:return {'error':'无创建权限'},403
-        nodes={x['id']:x for x in tree(s)};node=nodes.get(int(d['category_id']))
+        nodes={x['id']:x for x in tree(s)};node=nodes.get(int(d.get('category_id') or 0))
         if not node or node['folder'] or not node['effective_enabled']:return {'error':'请选择已启用的末级分类'},400
-        by=s.get(Author,int(d['byline_id']))
+        by=s.get(Author,int(d.get('byline_id') or 0))
         if by and not by.enabled:by=None
         cat=s.get(Category,node['id']);cfg=json.loads(cat.config)
         if not by or cfg['kind'] not in json.loads(by.types):raise ValueError('署名作者未启用或不适用于该报告类型')
-        commodity=s.execute(select(Commodity).where(Commodity.name==d['commodity'],Commodity.enabled==1)).scalars().first()
+        commodity=s.execute(select(Commodity).where(Commodity.name==d.get('commodity',''),Commodity.enabled==1)).scalars().first()
         if not commodity:raise ValueError('研究品种未启用')
         if commodity.parent_id:
             parent=s.get(Commodity,commodity.parent_id)
@@ -256,7 +281,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         if collaboration=='personal':collaborators=[]
         for person in collaborators:
             row=s.get(User,person)
-            if not row or row.role not in ['researcher','admin']:raise ValueError('协作人必须为研究员或管理员')
+            if not row or not row.enabled or row.role not in ['researcher','admin']:raise ValueError('协作人必须为已启用的研究员或管理员')
         date=e.text(d.get('report_date',''),10);datetime.date.fromisoformat(date)
         layout=d.get('layout',cfg['layout'])
         if layout not in ['flow','grid','free']:raise ValueError('布局无效')
@@ -279,7 +304,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
                 for block in section['blocks']:
                     for key,val in {'x':30,'y':70+index*230,'width':620,'height':210}.items():block.setdefault(key,val)
                     index+=1
-        md={'schema':1,'summary':e.text(d.get('summary',''),2000),'byline_id':by.id,'byline':by.name,'byline_license':by.license or '','report_date':date,'collaboration':collaboration,'collaborators':collaborators,'public':bool(d.get('public',True)),'layout':layout,'creation':'inherit' if inherited else 'new'}
+        md={'schema':1,'summary':e.text(d.get('summary',''),2000),'byline_id':by.id,'byline':by.name,'byline_license':by.license or '','report_date':date,'collaboration':collaboration,'collaborators':collaborators,'public':bool(d.get('public',True)),'layout':layout,'creation':'inherit' if inherited else 'new','template_section_ids':[section['id'] for section in cfg['sections']]}
         r.document=e.dump(doc);r.config_snapshot=e.dump(cfg);r.metadata_=e.dump(md)
         first=s.execute(select(Version).where(Version.report_id==rid,Version.version==1)).scalars().first()
         if first:
@@ -353,7 +378,18 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
                     item=s.get(Commodity,cid)
                     if not item or not item.enabled:raise ValueError('关联品种不存在或已停用')
                 section.update(title=title,editors=editors,tags=[e.text(x,30) for x in tags],commodity_ids=commodity_ids,revision=section['revision']+1)
+                for key,limit in [('group',60),('label',20),('type',80)]:
+                    if key in d:section[key]=e.text(d[key],limit).strip()
+                if 'required' in d:
+                    if type(d['required']) is not bool:raise ValueError('必填设置无效')
+                    section['required']=d['required']
             else:raise ValueError('不支持的章节操作')
+        cfg=json.loads(r.config_snapshot)
+        if action in ['add','remove','up','down']:renumber_chapters(doc)
+        align_section_config(cfg,doc)
+        if action=='edit' and 'default' in d:
+            next(item for item in cfg['sections'] if item['id']==section['id'])['default']=e.text(d['default'],50000)
+        r.config_snapshot=e.dump(cfg)
         return save_doc(s,r,u,doc,stamp,snapshot,event,'管理报告章节',action)
     if not section:raise ValueError('章节不存在')
     if int(d['revision'])!=section['revision']:return {'error':'此章节已有新版本，请刷新后合并修改'},409

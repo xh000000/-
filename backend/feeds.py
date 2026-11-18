@@ -19,6 +19,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import ssl
+import truststore
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +31,9 @@ from db import DataSourceConfig, DataSyncJob
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 
 KINDS = [
+    {'key': 'eastmoney_snapshot', 'label': '东方财富 · 最新指数快照', 'hint': '最新点位与成交量，按行情时间入库，不是历史日线'},
+    {'key': 'eastmoney_index', 'label': '东方财富 · 指数日线', 'hint': '公开指数日线（收盘点位 / 成交量）'},
+    {'key': 'sina_index', 'label': '新浪财经 · 指数日线', 'hint': '公开指数日线（收盘点位 / 成交量）'},
     {'key': 'generic_json', 'label': '通用 JSON 接口', 'hint': '任意 HTTP 接口，配请求模板与响应路径'},
     {'key': 'ifind_http', 'label': '同花顺 iFinD（HTTP）', 'hint': 'access_token + 历史行情，字段名可改'},
 ]
@@ -108,7 +113,8 @@ def _http(method: str, url: str, headers: dict, body: str, timeout: int) -> str:
     request = urllib.request.Request(url, data=payload, method=method.upper(),
                                      headers=headers or {})
     try:
-        with urllib.request.urlopen(request, timeout=max(3, min(int(timeout or 20), 120))) as response:
+        with urllib.request.urlopen(request, timeout=max(3, min(int(timeout or 20), 120)),
+                                    context=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)) as response:
             return response.read().decode('utf-8', errors='replace')
     except urllib.error.HTTPError as exc:
         detail = ''
@@ -231,6 +237,89 @@ def _rows_generic(config: DataSourceConfig, item: str, code: str, metric: str,
     return rows
 
 
+PUBLIC_INDEX_CODES = {
+    '上证指数': ('1.000001', 'sh000001'),
+    '深证成指': ('0.399001', 'sz399001'),
+    '沪深300': ('1.000300', 'sh000300'),
+}
+PUBLIC_URLS = {
+    'eastmoney_snapshot': 'https://push2.eastmoney.com/api/qt/stock/get',
+    'eastmoney_index': 'https://push2his.eastmoney.com/api/qt/stock/kline/get',
+    'sina_index': 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData',
+}
+
+
+def _rows_public(config, item, code, metric, start, end, days, options):
+    if item not in PUBLIC_INDEX_CODES:
+        raise FeedError('此通道支持上证指数、深证成指、沪深300，请选择对应指数')
+    if config.kind == 'eastmoney_snapshot':
+        if metric not in ('index_last', 'volume'):
+            raise FeedError('最新快照仅支持最新点位和成交量，不提供历史收盘价')
+        url = (config.base_url or PUBLIC_URLS[config.kind]) + '?' + urllib.parse.urlencode({
+            'secid': PUBLIC_INDEX_CODES[item][0], 'fields': 'f43,f47,f58,f59,f86'})
+        payload = _json_or_error(_http('GET', url, {'User-Agent': 'Mozilla/5.0'}, '', options.get('timeout') or 20), '东方财富最新快照')
+        data = _pick(payload, 'data')
+        if not isinstance(data, dict) or not data.get('f86'):
+            raise FeedError('东方财富未返回有效行情及行情时间')
+        date = dt.datetime.fromtimestamp(int(data['f86']), BEIJING).date().isoformat()
+        value = data.get('f47' if metric == 'volume' else 'f43')
+        if value in (None, '', '-'):
+            raise FeedError('行情字段暂无数值')
+        value = float(value)
+        if metric == 'volume':
+            value *= 100
+        else:
+            value /= 10 ** int(data.get('f59', 2))
+        if not math.isfinite(value):
+            raise FeedError('行情数值无效')
+        return [{'source': config.source, 'indicator': item + ('成交量快照' if metric == 'volume' else '最新点位'),
+                 'date': date, 'value': value, 'unit': '股' if metric == 'volume' else '点'}]
+    if metric not in ('index_close', 'close', 'volume'):
+        raise FeedError('指数日线仅支持收盘点位和成交量')
+    em, sina = PUBLIC_INDEX_CODES[item]
+    if config.kind == 'eastmoney_index':
+        params = {'secid': em, 'klt': 101, 'fqt': 0, 'lmt': days,
+                  'end': end.replace('-', ''), 'fields1': 'f1,f2,f3',
+                  'fields2': 'f51,f52,f53,f54,f55,f56'}
+    else:
+        params = {'symbol': sina, 'scale': 240, 'ma': 'no', 'datalen': days}
+    url = (config.base_url or PUBLIC_URLS[config.kind]) + '?' + urllib.parse.urlencode(params)
+    payload = _json_or_error(_http('GET', url, {'User-Agent': 'Mozilla/5.0'}, '',
+                                 options.get('timeout') or 20), '指数行情')
+    rows = []
+    if config.kind == 'eastmoney_index':
+        points = _pick(payload, 'data.klines')
+        if not isinstance(points, list):
+            raise FeedError('东方财富未返回日线数据')
+        for point in points:
+            fields = str(point).split(',')
+            if len(fields) >= 6:
+                rows.append((fields[0], fields[5] if metric == 'volume' else fields[2]))
+    else:
+        if not isinstance(payload, list):
+            raise FeedError('新浪财经未返回日线数据')
+        for point in payload:
+            if isinstance(point, dict):
+                rows.append((point.get('day'), point.get('volume' if metric == 'volume' else 'close')))
+    result = []
+    for date, value in rows:
+        date = _date_of(date)
+        if not date or not start <= date <= end or value in (None, '', '-'):
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        # 东方财富该接口的成交量为手；新浪为股，统一存为股。
+        if metric == 'volume' and config.kind == 'eastmoney_index':
+            value *= 100
+        result.append({'source': config.source, 'indicator': item + ('成交量' if metric == 'volume' else '收盘点位'),
+                       'date': date, 'value': value, 'unit': '股' if metric == 'volume' else '点'})
+    return result
+
+
 def _ifind_token(config: DataSourceConfig, options: dict) -> str:
     base = (config.base_url or '').rstrip('/')
     if not base:
@@ -320,8 +409,8 @@ def _prepare(session, payload: dict, config: DataSourceConfig | None = None) -> 
         raise FeedError('数据来源不存在或已停用，请先在「数据来源」里添加')
     kind = str(payload.get('kind') or 'generic_json').strip()
     if kind not in {item['key'] for item in KINDS}:
-        raise FeedError('取数方式需为 generic_json 或 ifind_http')
-    base_url = str(payload.get('base_url') or '').strip()
+        raise FeedError('请选择有效的取数方式')
+    base_url = str(payload.get('base_url') or PUBLIC_URLS.get(kind, '')).strip()
     if not base_url.lower().startswith(('http://', 'https://')):
         raise FeedError('接口地址需以 http:// 或 https:// 开头')
 
@@ -460,7 +549,9 @@ def _collect(session, config: DataSourceConfig, options: dict) -> tuple[list[dic
             code = code + suffix
         for metric in metrics:
             try:
-                if config.kind == 'ifind_http':
+                if config.kind in PUBLIC_URLS:
+                    got = _rows_public(config, item, code, metric, start, end, days, options)
+                elif config.kind == 'ifind_http':
                     got = _rows_ifind(config, item, code, metric, start, end, days, options, token)
                 else:
                     got = _rows_generic(config, item, code, metric, start, end, days, options)
@@ -499,6 +590,7 @@ def execute(session, config: DataSourceConfig, operator: str, trigger: str = 'ma
             counts = datasource.apply(session, cleaned, operator)
             note = '配置「%s」%s取数 %s 行' % (config.name or config.id,
                                             '定时' if trigger == 'schedule' else '手动', counts['total'])
+            note += '（新增 %s、更新 %s、重复跳过 %s）' % (counts['inserted'], counts['updated'], counts['skipped'])
             if problems:
                 note += '；跳过 %s 组：%s' % (len(problems), '；'.join(problems[:3]))
             datasource.finish_job(session, job, counts, now_str(), _scrub(note, config.secret or ''))
@@ -538,7 +630,9 @@ def preview(session, payload: dict) -> dict:
     import time as _time
     started = _time.time()
     try:
-        if probe.kind == 'ifind_http':
+        if probe.kind in PUBLIC_URLS:
+            rows = _rows_public(probe, item, code, metric, start, end, days, options)
+        elif probe.kind == 'ifind_http':
             token = _ifind_token(probe, options)
             rows = _rows_ifind(probe, item, code, metric, start, end, days, options, token)
         else:

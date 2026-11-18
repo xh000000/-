@@ -17,12 +17,19 @@ import datetime
 import json
 import math
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update, or_, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from db import DataSource, DataSyncJob, Observation
+from db import DataSource, DataSourceConfig, DataSyncJob, Observation, has_flag, set_flag
 
 # 内置来源：仅在 data_sources 表里没有时补种，之后以表为准（页面可再加别家）
 SEED_SOURCES = [
+    {'key': 'eastmoney', 'name': '东方财富', 'product': '公开指数最新行情',
+     'channel': '最新行情快照：上证指数、深证成指、沪深300；最新点位与成交量（非历史日线）',
+     'scope_mode': 'custom', 'scope_items': ['上证指数', '深证成指', '沪深300']},
+    {'key': 'sina', 'name': '新浪财经', 'product': '公开指数日线',
+     'channel': '公开行情：上证指数、深证成指、沪深300；收盘点位与成交量',
+     'scope_mode': 'custom', 'scope_items': ['上证指数', '深证成指', '沪深300']},
     {'key': 'ifind', 'name': '同花顺', 'product': 'iFinD',
      'channel': 'WorkBuddy 连接器（期货期权 / 行业经济指标）',
      'scope_mode': 'commodity', 'scope_items': []},
@@ -36,6 +43,7 @@ SOURCES = SEED_SOURCES  # 兼容旧引用；业务请用 sources(session)
 
 # 可同步的指标：key 用于作业范围，label 与单位用于指标命名（如「螺纹钢收盘价」）
 METRICS = [
+    {'key': 'index_last', 'label': '最新点位', 'unit': '点'},
     {'key': 'close', 'label': '收盘价', 'unit': '元/吨'},
     {'key': 'settle', 'label': '结算价', 'unit': '元/吨'},
     {'key': 'volume', 'label': '成交量', 'unit': '手'},
@@ -68,6 +76,14 @@ def ensure_sources(session) -> None:
             scope_mode=item.get('scope_mode', 'commodity'),
             scope_items=json.dumps(item.get('scope_items') or [], ensure_ascii=False),
             enabled=1, builtin=1, created_at=''))
+        if item['key'] in ('eastmoney', 'sina'):
+            from feeds import PUBLIC_URLS
+            kind = 'eastmoney_snapshot' if item['key'] == 'eastmoney' else 'sina_index'
+            session.add(DataSourceConfig(
+                name=item['name'] + (' · 最新指数快照' if item['key'] == 'eastmoney' else ' · 指数日线'), source=item['key'], kind=kind,
+                base_url=PUBLIC_URLS[kind], account='', secret='',
+                scope=json.dumps({'items': item['scope_items'], 'metrics': ['index_last' if item['key'] == 'eastmoney' else 'index_close', 'volume'], 'days': 10}),
+                options='{}', freq='manual', enabled=1, operator='system', created_at=''))
     session.flush()
 
 
@@ -143,37 +159,65 @@ def normalize(rows) -> list[dict]:
     return cleaned
 
 
-def apply(session, rows: list[dict], operator: str) -> dict:
-    """幂等入库：同来源 + 同指标 + 同日期视为同一条，有则改值、无则新增。
+def migrate_observation_uniqueness(session) -> int:
+    """清理存量重复，保留 ID 最大的一条，并为并发写入建立唯一约束。"""
+    if has_flag(session, 'observation-unique-v1'):
+        return 0
+    names = source_names(session)
+    aliases = {**names, **{name: name for name in names.values()}}
+    seen, removed, survivors = set(), 0, []
+    for row in session.scalars(select(Observation).order_by(Observation.id.desc())):
+        source = str(row.source or '').strip()
+        source = aliases.get(source, source)
+        indicator, date = str(row.indicator or '').strip(), str(row.date or '').strip()
+        key = (source, indicator, date)
+        if key in seen:
+            session.delete(row)
+            removed += 1
+        else:
+            seen.add(key)
+            survivors.append((row, key))
+    session.flush()
+    for row, key in survivors:
+        row.source, row.indicator, row.date = key
+    session.flush()
+    session.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS uq_observation_point '
+                         'ON observations (source, indicator, date)'))
+    set_flag(session, 'observation-unique-v1')
+    return removed
 
-    返回 inserted / updated / skipped（值没变化，跳过不写）。
-    """
+
+def apply(session, rows: list[dict], operator: str) -> dict:
+    """按来源、指标、日期幂等写入；批内最后一条有效记录优先，数据库兜底去重。"""
     if not rows:
         return {'inserted': 0, 'updated': 0, 'skipped': 0, 'total': 0}
-    dates = {row['date'] for row in rows}
-    existing = {}
-    for obs in session.execute(
-            select(Observation).where(Observation.date.in_(dates))).scalars():
-        existing[(obs.source, obs.indicator, obs.date)] = obs
-    inserted = updated = skipped = 0
+    names = source_names(session)
+    aliases = {**names, **{name: name for name in names.values()}}
+    unique = {}
     for row in rows:
-        key = (row['source'], row['indicator'], row['date'])
-        hit = existing.get(key)
-        if hit is None:
-            session.add(Observation(source=row['source'], indicator=row['indicator'],
-                                    date=row['date'], value=row['value'], unit=row['unit'],
-                                    uploaded_by=operator))
-            existing[key] = True
+        source = str(row['source']).strip()
+        key = (aliases.get(source, source), str(row['indicator']).strip(), row['date'])
+        unique[key] = {**row, 'source': key[0], 'indicator': key[1]}
+    inserted = updated = 0
+    skipped = len(rows) - len(unique)
+    for row in unique.values():
+        point = {k: row[k] for k in ('source', 'indicator', 'date', 'value', 'unit')}
+        result = session.execute(sqlite_insert(Observation).values(**point, uploaded_by=operator)
+                                 .on_conflict_do_nothing(index_elements=['source', 'indicator', 'date'])
+                                 .returning(Observation.id)).scalar_one_or_none()
+        if result is not None:
             inserted += 1
-        elif hit is True:
-            skipped += 1
-        elif abs((hit.value or 0) - row['value']) < 1e-9:
-            skipped += 1
-        else:
-            hit.value = row['value']
-            hit.unit = row['unit']
-            hit.uploaded_by = operator
+            continue
+        changed = session.execute(update(Observation).where(
+            Observation.source == row['source'], Observation.indicator == row['indicator'],
+            Observation.date == row['date'],
+            or_(Observation.value.is_(None), func.abs(Observation.value - row['value']) >= 1e-9,
+                Observation.unit.is_(None), Observation.unit != row['unit'])
+        ).values(value=row['value'], unit=row['unit'], uploaded_by=operator))
+        if changed.rowcount:
             updated += 1
+        else:
+            skipped += 1
     return {'inserted': inserted, 'updated': updated, 'skipped': skipped, 'total': len(rows)}
 
 

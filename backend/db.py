@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
-    Float, Integer, LargeBinary, Text, create_engine, event, inspect, select, text,
+    Float, Integer, LargeBinary, Text, UniqueConstraint, create_engine, event, inspect, select, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -150,6 +150,7 @@ class Event(Base, MappingMixin):
 
 class Observation(Base, MappingMixin):
     __tablename__ = 'observations'
+    __table_args__ = (UniqueConstraint('source', 'indicator', 'date', name='uq_observation_point'),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source: Mapped[str | None] = mapped_column(Text)
     indicator: Mapped[str | None] = mapped_column(Text)

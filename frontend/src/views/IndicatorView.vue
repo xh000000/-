@@ -1,29 +1,21 @@
 <template>
-  <div>
+  <div class="indicator-page">
     <PageHead
       title="指标查询"
-      description="按来源与名称检索已入库的指标，查看区间统计、走势与逐日明细；数据来自「手工数据录入」的同步结果。"
+      description="按来源与名称检索已入库的指标，查看区间统计、走势与逐日明细；数据来自「数据录入」的同步结果。"
     >
       <el-button :loading="loading" @click="load">刷新</el-button>
     </PageHead>
 
     <div class="panel ind-filter">
       <div class="row">
-        <el-radio-group v-model="source">
-          <el-radio-button label="">全部来源</el-radio-button>
-          <el-radio-button v-for="item in sources" :key="item.key" :label="item.key">
-            {{ item.name }}
-          </el-radio-button>
-        </el-radio-group>
-        <el-input
-          v-model="keyword"
-          placeholder="搜索指标名，如 螺纹钢 / 南华"
-          clearable
-          style="width: 240px"
-        />
-        <span class="tiny" style="margin-left: auto">
-          {{ filtered.length }} 个指标 · {{ totalPoints }} 个数据点
-        </span>
+        <span class="source-label">来源</span>
+        <el-select v-model="selectedSources" multiple clearable filterable collapse-tags collapse-tags-tooltip
+          placeholder="全部来源" aria-label="选择数据来源，可多选" class="source-select">
+          <el-option v-for="item in sources" :key="item.key" :label="item.name" :value="item.key" />
+        </el-select>
+        <el-input v-model="keyword" placeholder="搜索指标名，如 上证指数 / 螺纹钢" clearable class="indicator-search" />
+        <span class="tiny result-summary">{{ selectedSourceName }} · {{ filtered.length }} 个指标 · {{ totalPoints.toLocaleString() }} 个数据点</span>
       </div>
     </div>
 
@@ -56,7 +48,7 @@
             </span>
           </button>
           <p v-if="!filtered.length" class="caption ind-empty">
-            {{ indicators.length ? '没有匹配的指标，换个关键字试试' : '还没有入库数据，先去「手工数据录入」同步一次' }}
+            {{ keyword.trim() ? '没有匹配的指标，换个关键字试试' : `${selectedSourceName}暂无入库指标，请先在「数据录入」同步数据` }}
           </p>
         </div>
       </div>
@@ -167,7 +159,7 @@
         </template>
         <div v-else class="ind-placeholder">
           <p class="caption">
-            {{ indicators.length ? '没有匹配的指标，清空关键字或切换来源后再看' : '还没有入库数据，先去「手工数据录入」同步一次' }}
+            {{ keyword.trim() ? '没有匹配的指标，清空关键字或切换来源后再看' : `${selectedSourceName}暂无入库指标，请先在「数据录入」同步数据` }}
           </p>
         </div>
       </div>
@@ -176,7 +168,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import PageHead from '../components/PageHead.vue';
 import { api } from '../api';
@@ -191,7 +183,7 @@ const indicators = ref([]);
 const sources = ref([]);
 const loading = ref(false);
 const seriesLoading = ref(false);
-const source = ref('');
+const selectedSources = ref([]);
 const keyword = ref('');
 const current = ref(null);
 const series = ref(null);
@@ -202,10 +194,18 @@ const gradientId = GRADIENT_ID;
 const filtered = computed(() => {
   const word = keyword.value.trim();
   return indicators.value.filter(item => {
-    if (source.value && item.source_key !== source.value) return false;
+    if (selectedSources.value.length && !selectedSources.value.includes(item.source_key)) return false;
     if (word && !item.indicator.includes(word)) return false;
     return true;
   });
+});
+
+const selectedSourceName = computed(() => !selectedSources.value.length ? '全部来源'
+  : sources.value.filter(item => selectedSources.value.includes(item.key)).map(item => item.name).join('、'));
+watch(filtered, rows => {
+  if (rows.some(isActive)) return;
+  if (rows.length) select(rows[0]);
+  else { current.value = null; series.value = null; }
 });
 
 const totalPoints = computed(() => filtered.value.reduce((sum, item) => sum + item.points, 0));
@@ -289,6 +289,7 @@ async function load() {
       metric_label: METRIC_LABELS[item.metric] || '',
     }));
     sources.value = result.sources || [];
+    selectedSources.value = selectedSources.value.filter(key => sources.value.some(item => item.key === key));
     if (current.value) {
       const still = indicators.value.find(isActive);
       if (still) current.value = still;
@@ -305,13 +306,17 @@ async function load() {
 }
 
 function select(item) {
+  series.value = null;
   current.value = item;
   range.value = null;
   loadSeries();
 }
 
+let seriesRequest = 0;
 async function loadSeries() {
+  const requestId = ++seriesRequest;
   if (!current.value) return;
+  const requested = current.value;
   seriesLoading.value = true;
   try {
     const query = new URLSearchParams({
@@ -320,14 +325,25 @@ async function loadSeries() {
     });
     if (range.value?.[0]) query.set('start', range.value[0]);
     if (range.value?.[1]) query.set('end', range.value[1]);
-    series.value = await api(`data/series?${query.toString()}`);
+    const result = await api(`data/series?${query.toString()}`);
+    if (requestId === seriesRequest && current.value === requested) series.value = result;
   } catch (error) {
-    series.value = null;
-    ElMessage.error(error.message || '读取指标序列失败');
+    if (requestId === seriesRequest && current.value === requested) {
+      series.value = null;
+      ElMessage.error(error.message || '读取指标序列失败');
+    }
   } finally {
-    seriesLoading.value = false;
+    if (requestId === seriesRequest) seriesLoading.value = false;
   }
 }
 
 onMounted(load);
 </script>
+
+<style scoped>
+.source-label { color: #64748b; font-size: 13px; }
+.source-select { width: 260px; max-width: 100%; }
+.indicator-search { width: 300px; max-width: 100%; }
+.result-summary { margin-left: auto; }
+@media (max-width: 640px) { .result-summary { width: 100%; margin-left: 0; } }
+</style>

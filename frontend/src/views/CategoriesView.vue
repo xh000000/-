@@ -1,7 +1,7 @@
 <template>
   <div>
     <template v-if="!draft">
-      <PageHead title="研报分类树" description="最多三级。末级分类配置报告章节结构与审批；上级分类用于组织目录。">
+      <PageHead title="研报分类树" description="最多三级。末级分类配置报告章节结构与关联审批流；上级分类用于组织目录。">
         <el-button type="primary" @click="openTreeDialog(null)">添加分类</el-button>
       </PageHead>
 
@@ -29,6 +29,9 @@
               </el-tag>
             </template>
           </el-table-column>
+          <el-table-column label="关联审批流" min-width="180">
+            <template #default="{ row }"><span v-if="!row.folder">{{ flows.find(flow => flow.category_ids.includes(row.id))?.name || '沿用上级或默认流程' }}</span></template>
+          </el-table-column>
           <el-table-column label="排序" width="80" prop="sort_order" />
           <el-table-column label="操作" width="210">
             <template #default="{ row }">
@@ -41,7 +44,7 @@
     </template>
 
     <template v-else>
-      <PageHead :title="draft.name" description="配置章节结构、版式与审批节点；保存后只影响后续新建报告，历史报告沿用创建时的配置快照。">
+      <PageHead :title="draft.name" description="配置章节结构、版式与关联审批流；新建研报自动继承；已有草稿可在编辑器主动同步章节与审批，送审后的报告继续沿用原快照。">
         <el-button @click="draft = null">返回分类列表</el-button>
       </PageHead>
 
@@ -170,47 +173,21 @@
         </div>
 
         <div class="panel span-2">
-          <div class="panel-header">
-            <h3>④ 审批节点</h3>
-            <el-button size="small" @click="addNode">添加节点</el-button>
-          </div>
-          <div v-for="(node, index) in draft.config.workflow" :key="index" class="config-section">
-            <div class="config-section-head">
-              <b>节点 {{ index + 1 }}</b>
-              <span>
-                <el-button link size="small" :disabled="index === 0" @click="moveNode(index, -1)">↑</el-button>
-                <el-button link size="small" :disabled="index === draft.config.workflow.length - 1" @click="moveNode(index, 1)">↓</el-button>
-                <el-button link type="danger" size="small" :disabled="draft.config.workflow.length === 1" @click="removeNode(index)">删除</el-button>
-              </span>
-            </div>
-            <div class="form-row">
-              <el-form-item label="节点名称" label-width="72px" style="flex: 1 1 150px">
-                <el-input v-model="node.label" />
-              </el-form-item>
-              <el-form-item label="角色" label-width="52px" style="flex: 1 1 140px">
-                <el-select v-model="node.role" style="width: 100%" @change="node.users = []">
-                  <el-option label="研究复核" value="reviewer" />
-                  <el-option label="合规审核" value="compliance" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="方式" label-width="52px" style="flex: 1 1 140px">
-                <el-select v-model="node.mode" style="width: 100%">
-                  <el-option v-for="(name, key) in MODE_NAMES" :key="key" :label="name" :value="key" />
-                </el-select>
-              </el-form-item>
-            </div>
-            <el-form-item label="指定审批人" label-width="86px">
-              <el-select v-model="node.users" multiple placeholder="留空表示该角色任一账号可签" style="width: 100%">
-                <el-option v-for="one in roleUsers(node.role)" :key="one.id" :label="one.name" :value="one.id" />
+          <div class="panel-header"><h3>④ 关联审批流</h3></div>
+          <el-form label-width="96px">
+            <el-form-item label="审批流">
+              <el-select v-model="draft.approval_flow_id" filterable placeholder="选择审批流" style="width: 100%">
+                <el-option label="沿用上级或默认流程" :value="0" />
+                <el-option v-for="flow in flows.filter(item => item.enabled || item.id === draft.approval_flow_id)" :key="flow.id" :label="flow.name + (flow.enabled ? '' : '（已停用，请重新选择）')" :value="flow.id" :disabled="!flow.enabled" />
               </el-select>
             </el-form-item>
-          </div>
-          <p class="caption">流程必须包含一个合规审核节点；会签与依次审批必须指定审批人。</p>
-          <div class="row" style="margin-top: 12px">
-            <el-button type="primary" :loading="busy" @click="saveConfig">保存配置</el-button>
-            <el-button @click="draft = null">取消</el-button>
-          </div>
+          </el-form>
+          <p class="caption">节点在“审批流设置”中统一维护。新研报使用关联流程；已有草稿可在编辑器同步，已送审研报保持原审批快照。</p>
         </div>
+      </div>
+      <div class="panel category-config-actions">
+        <el-button type="primary" :loading="busy" @click="saveConfig">保存配置</el-button>
+        <el-button :disabled="busy" @click="draft = null">取消</el-button>
       </div>
     </template>
 
@@ -253,12 +230,13 @@
 </template>
 
 <script setup>
-import { computed, reactive, ref } from 'vue';
+import { computed, reactive, ref, onMounted } from 'vue';
+import { useRoute } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import PageHead from '../components/PageHead.vue';
 import { api } from '../api';
-import { categories, categoryTree, commodities, refresh, users } from '../store/session';
-import { MODE_NAMES, makeId } from '../utils/format';
+import { categories, categoryTree, commodities, refresh, flows } from '../store/session';
+import { makeId } from '../utils/format';
 
 const busy = ref(false);
 
@@ -337,7 +315,6 @@ const commoditiesText = computed({
   },
 });
 
-const roleUsers = role => users.value.filter(item => item.role === role);
 
 function startConfig(row) {
   const source = categories.value.find(item => item.id === row.id);
@@ -346,6 +323,7 @@ function startConfig(row) {
     id: source.id,
     name: source.name,
     revision: source.revision,
+    approval_flow_id: flows.value.find(flow => flow.category_ids.includes(source.id))?.id || 0,
     enabled: Boolean(source.enabled),
     config: JSON.parse(JSON.stringify(source.config)),
   };
@@ -369,39 +347,16 @@ function moveSection(index, delta) {
   [list[index], list[target]] = [list[target], list[index]];
 }
 
-function addNode() {
-  draft.value.config.workflow.push({ label: '研究复核', role: 'reviewer', mode: 'any', users: [] });
-}
-
-function removeNode(index) {
-  if (draft.value.config.workflow.length === 1) return;
-  draft.value.config.workflow.splice(index, 1);
-}
-
-function moveNode(index, delta) {
-  const list = draft.value.config.workflow;
-  const target = index + delta;
-  if (target < 0 || target >= list.length) return;
-  [list[index], list[target]] = [list[target], list[index]];
-}
-
 async function saveConfig() {
   const current = draft.value;
   if (!current.config.kind?.trim()) return ElMessage.warning('请填写报告类型');
   if (!current.config.sections.length) return ElMessage.warning('至少配置一个章节');
-  if (!current.config.workflow.some(item => item.role === 'compliance')) {
-    return ElMessage.warning('审批流必须包含一个合规审核节点');
-  }
-  const invalid = current.config.workflow.find(
-    item => item.mode !== 'any' && !(item.users || []).length
-  );
-  if (invalid) return ElMessage.warning(`节点「${invalid.label}」为${MODE_NAMES[invalid.mode]}，必须指定审批人`);
-
   busy.value = true;
   try {
     await api('categories', {
       id: current.id,
       revision: current.revision,
+      approval_flow_id: current.approval_flow_id,
       name: current.name,
       config: current.config,
       enabled: current.enabled,
@@ -415,4 +370,18 @@ async function saveConfig() {
     busy.value = false;
   }
 }
+const route = useRoute();
+onMounted(() => {
+  const id = Number(route.query?.category);
+  const row = categoryTree.value.find(item => item.id === id && !item.folder);
+  if (row) startConfig(row);
+});
 </script>
+
+<style scoped>
+.category-config-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+}
+</style>

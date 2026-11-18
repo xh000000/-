@@ -172,7 +172,7 @@ def validate_config(s,d):
         if mode!='any' and not users:raise ValueError('会签和依次审批必须指定人员')
         for person in users:
             account=s.get(User,person)
-            if not account or account.role!=role:raise ValueError('指定人员不属于节点角色')
+            if not account or not account.enabled or account.role!=role:raise ValueError('指定人员不存在、已停用或不属于节点角色')
         labels.add(label);out['workflow'].append({'label':label,'role':role,'mode':mode,'users':users})
     if not any(n['role']=='compliance' for n in out['workflow']):raise ValueError('审批流程必须包含合规审核节点')
     return name,out
@@ -278,6 +278,11 @@ def eligibility(s,r,u):
 def handle(s,path,d,u,stamp,snapshot,event,checks):
     if path=='/api/categories':
         if u['role']!='admin':return {'error':'仅管理员可配置分类'},403
+        selected_flow=None
+        if 'approval_flow_id' in d and d.get('approval_flow_id'):
+            selected_flow=s.get(ApprovalFlow,int(d['approval_flow_id']))
+            if not selected_flow or not selected_flow.enabled:raise ValueError('审批流不存在或已停用，请重新选择')
+            d={**d,'config':{**d['config'],'workflow':json.loads(selected_flow.nodes)}}
         name,cfg=validate_config(s,d)
         if d.get('id'):
             old=s.get(Category,int(d['id']))
@@ -289,6 +294,12 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
             revision=1
             created=Category(name=name,config=dump(cfg),enabled=int(bool(d.get('enabled',True))))
             s.add(created);s.flush();cid=created.id
+        if 'approval_flow_id' in d:
+            # One direct association per category; both configuration screens share this relation.
+            for flow in s.execute(select(ApprovalFlow)).scalars():
+                ids=[x for x in json.loads(flow.category_ids) if x!=cid]
+                if selected_flow and flow.id==selected_flow.id:ids.append(cid)
+                flow.category_ids=dump(ids)
         s.add(ConfigEvent(category_id=cid,actor=u['name'],config=dump({'name':name,'config':cfg,'enabled':bool(d.get('enabled',True))}),revision=revision,at=stamp()))
         return {'id':cid},200
     if path=='/api/reports' and d.get('category_id'):
@@ -342,9 +353,9 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         for node in cfg['workflow']:
             if node['users'] and r.author in node['users']:return {'error':'作者被指定为审核人，请联系管理员调整分类后重新创建报告'},400
             if node['users']:
-                available=s.execute(select(func.count()).select_from(User).where(User.role==node['role'],User.id.in_(node['users']))).scalar()
+                available=s.execute(select(func.count()).select_from(User).where(User.role==node['role'],User.enabled==1,User.id.in_(node['users']))).scalar()
                 if available!=len(node['users']):return {'error':'指定审核人已不可用'},400
-            elif not s.execute(select(User.id).where(User.role==node['role'],User.id!=r.author).limit(1)).first():return {'error':'尚未创建可用的'+node['label']+'账号'},400
+            elif not s.execute(select(User.id).where(User.role==node['role'],User.enabled==1,User.id!=r.author).limit(1)).first():return {'error':'尚未创建可用的'+node['label']+'账号'},400
         ws={'index':0,'approvals':[]};target=cfg['workflow'][0]['label']
     elif action=='退回':
         if not note:raise ValueError('退回原因必填')
@@ -354,5 +365,6 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         node=cfg['workflow'][ws['index']];ws['approvals'].append(u['id'])
         if node['mode']=='any' or set(node['users'])<=set(ws['approvals']):
             ws={'index':ws['index']+1,'approvals':[]};target=cfg['workflow'][ws['index']]['label'] if ws['index']<len(cfg['workflow']) else '待发布'
+    if action in ['提交','退回']:r.scheduled_at=''
     r.status=target;r.workflow_state=dump(ws);r.updated=stamp()
     event(s,r,u,action,note);return {'ok':True},200

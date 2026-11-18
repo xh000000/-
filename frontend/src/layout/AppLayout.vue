@@ -61,11 +61,7 @@
           </template>
         </div>
         <div class="tools">
-          <span class="user-chip">
-            <i>{{ initial }}</i>{{ user.name }}<em>{{ roleName }}</em>
-          </span>
-          <el-button link type="primary" @click="passwordVisible = true">修改密码</el-button>
-          <el-button link @click="onLogout">退出</el-button>
+          <AccountMenu @password="passwordVisible = true" @logout="onLogout" />
         </div>
       </el-header>
       <el-main class="app-main">
@@ -83,27 +79,21 @@
 import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { MENU, breadcrumb } from '../utils/menu';
+import { MENU, breadcrumb, filterMenu } from '../utils/menu';
 import { ROLE_NAMES } from '../utils/format';
-import { isAdmin, logout, user } from '../store/session';
+import { isAdmin, logout, user, session } from '../store/session';
 import ChangePasswordDialog from '../components/ChangePasswordDialog.vue';
+import AccountMenu from '../components/AccountMenu.vue';
 
 const route = useRoute();
 const router = useRouter();
 const passwordVisible = ref(false);
 
 const roleName = computed(() => ROLE_NAMES[user.value.role] || user.value.role || '');
-const initial = computed(() => String(user.value.name || '研').slice(0, 1));
 const crumbs = computed(() => breadcrumb(route.path));
 
-/* 管理员专属的菜单项对非管理员隐藏；保留位置的未接入模块仍然显示，但不可点。 */
-const visibleMenu = computed(() =>
-  MENU.filter(group => !group.admin || isAdmin.value).map(group =>
-    group.children
-      ? { ...group, children: group.children.filter(child => !child.admin || isAdmin.value) }
-      : group
-  ).filter(group => !group.children || group.children.length)
-);
+/* 全局显示开关叠加账号权限；系统设置及其全部子菜单仅管理员可见。 */
+const visibleMenu = computed(() => filterMenu(MENU, user.value, session.data?.menu_visibility || {}));
 
 /* 当前页所属分组默认展开，其余按手册的常用入口各展开一个。 */
 const opened = computed(() => {

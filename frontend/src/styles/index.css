@@ -665,7 +665,7 @@ a:hover { color: var(--el-color-primary-light-3); }
 .ai-actions .el-button + .el-button { margin-left: 0; }
 .ai-dirty { font-size: 11.5px; color: var(--el-color-warning); }
 
-/* 数据来源卡片（手工数据录入） */
+/* 数据来源卡片（数据录入） */
 .src-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .src-head h3 { line-height: 1.5; }
 .src-facts {

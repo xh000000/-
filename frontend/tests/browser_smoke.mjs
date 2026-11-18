@@ -36,15 +36,16 @@ const ROUTES = [
   ['/library/cloud', '云盘'],
   ['/library/docs', '文档管理库'],
   ['/library/materials', '素材库'],
-  ['/data', '手工数据录入'],
+  ['/data', '数据录入'],
   ['/data/indicators', '指标查询'],
   ['/config/categories', '研报分类树'],
   ['/config/authors', '作者管理'],
   ['/config/commodities', '品种管理'],
-  ['/config/flows', '审批流配置'],
+  ['/config/flows', '审批流设置'],
   ['/system/departments', '部门管理'],
+  ['/system/users', '账号管理'],
   ['/system/roles', '角色管理'],
-  ['/system/settings', '基本配置'],
+  ['/system/models', '外部模型'],
 ];
 
 const NOISE = [

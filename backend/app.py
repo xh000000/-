@@ -21,6 +21,8 @@ import json
 import math
 import os
 import secrets
+import ssl
+import truststore
 import shlex
 import shutil
 import subprocess
@@ -37,16 +39,19 @@ from urllib.parse import quote
 from fastapi import Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import db as database
 import datasource
+import menu_settings
+import ai_profiles
 import feeds
 import iam_engine as iam
 import library_engine as library
 import manual_engine as manual
+import report_templates
 import printview
 import report_engine as engine
 from db import (AppSetting, Commodity, Event, LibraryItem, Observation, PublicationHistory,
@@ -78,6 +83,7 @@ def init() -> None:
         library.migrate(session)
         iam.migrate(session)
         datasource.ensure_sources(session)
+        datasource.migrate_observation_uniqueness(session)
         database.add_columns(session, 'reports', {'scheduled_at': "TEXT DEFAULT ''"})
         session.commit()
 
@@ -158,11 +164,16 @@ def publish_due() -> None:
             if due > now:
                 continue
             at = stamp()
-            report.status = '已发布'
-            report.published_at = at
-            report.scheduled_at = ''
-            report.updated_by = '系统定时发布'
-            report.updated = at
+            claimed = session.execute(update(Report).where(
+                Report.id == report.id, Report.status == '待发布',
+                Report.scheduled_at == report.scheduled_at, Report.version == report.version,
+            ).values(status='已发布', published_at=at, scheduled_at='',
+                     updated_by='系统定时发布', updated=at)
+              .execution_options(synchronize_session=False).returning(Report.id)).scalar_one_or_none()
+            if claimed is None:
+                # The appointment was cancelled, withdrawn or already published.
+                continue
+            session.refresh(report)
             session.add(PublicationHistory(
                 report_id=report.id, version=report.version, document=report.document,
                 config=report.config_snapshot, metadata_=report.metadata_, body=report.body, published_at=at))
@@ -459,11 +470,14 @@ def get_state(request: Request, session: Session = Depends(get_db)):
                func.max(Observation.date).label('latest'), func.count().label('points'))
         .group_by(Observation.source, Observation.indicator, Observation.unit)
         .order_by(Observation.indicator))
+    department = session.get(database.Department, user.dept_id) if user.dept_id else None
     return _json({
         **manual.catalogs(session), 'library': library.items(session),
         'user': {'id': user['id'], 'name': user['name'], 'role': user['role'], 'role_id': user['role_id'],
-                 'dept_id': user['dept_id'], 'phone': user['phone'], 'title': user['title'],
+                 'dept_id': user['dept_id'], 'dept_name': department.name if department else '',
+                 'phone': user['phone'], 'title': user['title'],
                  'menus': iam.menus_for(session, user)},
+        'menu_visibility': menu_settings.read(session)['visibility'],
         'reports': reports, 'categories': engine.categories(session),
         'indicators': [dict(r._mapping) for r in indicators],
         'data': [x.to_dict() for x in session.execute(
@@ -472,6 +486,16 @@ def get_state(request: Request, session: Session = Depends(get_db)):
         'departments': iam.departments(session) if admin else [], 'flows': iam.flows(session) if admin else [],
         'ai': bool(_ai_key(session)), 'model': _ai_model(session),
     })
+
+
+@app.get('/api/report-template/{rid}', summary='查看研报最新分类章节与审批模板')
+def get_report_template(rid: int, request: Request, session: Session = Depends(get_db)):
+    user = context_of(request, session)['u']
+    report = session.get(Report, rid)
+    if not report or not manual.can_view(session, report, user):
+        raise ApiError(403, '无权访问此报告')
+    return _json({**report_templates.preview(session, report),
+                  'can_sync': report.author == user.id and report.status in ['草稿', '已退回'] and bool(manual.meta(report))})
 
 
 @app.get('/api/history/{rid}', summary='研报操作日志与历史版本')
@@ -492,6 +516,31 @@ def get_history(request: Request, rid: str, session: Session = Depends(get_db)):
     })
 
 
+def _legacy_ai_profile(session):
+    # Read all legacy fields in one query and retain a request-local snapshot.
+    # A concurrent edit must not mix one endpoint's key with another model.
+    if 'legacy_ai_profile' not in session.info:
+        stored = dict(session.execute(select(AppSetting.key, AppSetting.value).where(
+            AppSetting.key.in_(['ai_model', 'ai_base_url', 'ai_api_key']))).all())
+        session.info['legacy_ai_profile'] = {
+            'id': 'legacy', 'name': '原有配置', 'provider': _ai_provider(),
+            'model': stored.get('ai_model') or (os.getenv('AI_MODEL') or '').strip(),
+            'base_url': (stored.get('ai_base_url') or os.getenv('AI_BASE_URL', 'https://api.openai.com/v1')).rstrip('/'),
+            'api_key': stored.get('ai_api_key') or os.getenv('AI_API_KEY') or os.getenv('CODEBUDDY_API_KEY') or ''}
+    return session.info['legacy_ai_profile']
+
+
+@app.post('/api/ai/profiles', summary='保存、启用或删除模型配置（仅管理员）')
+async def post_ai_profile(request: Request, session: Session = Depends(get_db)):
+    user = context_of(request, session)['u']
+    if user.role != 'admin':
+        raise ApiError(403, '仅管理员可管理外部模型')
+    data = await payload(request)
+    result, status = ai_profiles.mutate(session, data, lambda: _legacy_ai_profile(session), stamp())
+    session.commit()
+    return _json(result, status)
+
+
 @app.get('/api/ai/config', summary='外部模型配置与上游可用模型')
 def get_ai_config(request: Request, session: Session = Depends(get_db)):
     user = resolve_user(session, _pick_token(request.cookies))
@@ -499,7 +548,7 @@ def get_ai_config(request: Request, session: Session = Depends(get_db)):
         raise ApiError(401, '请先登录')
     if user['role'] != 'admin':
         raise ApiError(403, '仅管理员可配置外部模型')
-    provider = _ai_provider()
+    provider = _ai_provider(session)
     key = _ai_key(session)
     base = _ai_base(session)
     # 这里只读缓存、不打上游：否则每次进设置页都要等 /models 超时，
@@ -510,15 +559,20 @@ def get_ai_config(request: Request, session: Session = Depends(get_db)):
         models, note = [], ''
     else:
         models, note = _model_options(base, key)
+    profiles_state = ai_profiles.read(session)
+    active_profile = ai_profiles.active(session)
     stored_key = _setting(session, 'ai_api_key')
     stored_base = _setting(session, 'ai_base_url')
     return _json({
+        'active_profile_id': profiles_state['active_id'], 'profile_revision': profiles_state['revision'],
+        'profiles': [ai_profiles.public(p, _mask_key) for p in [_legacy_ai_profile(session), *profiles_state['profiles']]],
+        'active_profile_name': active_profile['name'] if active_profile else '原有配置',
         'provider': provider, 'base_url': base, 'key_set': bool(key),
-        'key_masked': _mask_key(key), 'key_source': '设置' if stored_key else ('环境变量' if key else '未配置'),
+        'key_masked': _mask_key(key), 'key_source': '模型配置' if active_profile else ('设置' if stored_key else ('环境变量' if key else '未配置')),
         'base_source': '设置' if stored_base else '环境变量',
         'model': _ai_model(session),
         'default_model': (os.getenv('AI_MODEL') or '').strip(),
-        'source': '设置' if _setting(session, 'ai_model') else '环境变量',
+        'source': '模型配置' if active_profile else ('设置' if _setting(session, 'ai_model') else '环境变量'),
         'models': models, 'note': note,
         'max_tokens': int(os.getenv('AI_MAX_TOKENS', '8000')),
     })
@@ -537,19 +591,34 @@ async def post_ai_test(request: Request, session: Session = Depends(get_db)):
     if user['role'] != 'admin':
         raise ApiError(403, '仅管理员可测试外部模型')
     data = await payload(request)
-    base = str(data.get('base_url') or '').strip().rstrip('/') or _ai_base(session)
-    key = str(data.get('api_key') or '').strip() or _ai_key(session)
-    # 只验表单里的模型名：表单留空时不要拿库里保存的模型顶替，否则提示会答非所问
+    profile_id = data.get('profile_id')
+    if profile_id == 'legacy':
+        selected = _legacy_ai_profile(session)
+    elif profile_id:
+        selected = next((p for p in ai_profiles.read(session)['profiles'] if p['id'] == profile_id), None)
+        if selected is None:
+            raise ApiError(404, '模型配置不存在')
+    elif 'profile_id' not in data:
+        selected = ai_profiles.active(session) or _legacy_ai_profile(session)
+    else:
+        selected = {}
+    base = str(data.get('base_url') or selected.get('base_url') or '').strip().rstrip('/')
+    if base:
+        base = ai_profiles.valid_base(base)
+    key = str(data.get('api_key') or '').strip()
+    if not key and base == selected.get('base_url'):
+        key = selected.get('api_key') or ''
     model = str(data.get('model') or '').strip()
+    clean = lambda text: str(text).replace(key, '***') if key else str(text)
     started = time.time()
     if not key:
         return _json({'ok': False, 'ms': 0, 'models': [],
                       'message': '还没有填写密钥，无法连接上游'})
 
     models, note = await run_in_threadpool(_upstream_models, base, key)
-    if note:
+    if note and not model:
         return _json({'ok': False, 'models': [],
-                      'ms': int((time.time() - started) * 1000), 'message': note})
+                      'ms': int((time.time() - started) * 1000), 'message': clean(note)})
     _remember_models(base, key, models)
 
     if model:
@@ -558,16 +627,35 @@ async def post_ai_test(request: Request, session: Session = Depends(get_db)):
         except Exception as exc:  # 密钥没问题，只是这个模型名调不通
             return _json({'ok': False, 'models': models,
                           'ms': int((time.time() - started) * 1000),
-                          'message': '地址和密钥可用，但模型「%s」调用失败：%s' % (model, _clip(str(exc), 200))})
+                          'message': '地址和密钥可用，但模型「%s」调用失败：%s' % (model, _clip(clean(exc), 200))})
     return _json({
         'ok': True, 'models': models, 'ms': int((time.time() - started) * 1000),
-        'message': '连接正常，密钥可用' + ('，模型「%s」可调用' % model if model else ''),
+        'message': '连接正常，密钥可用' + ('，模型「%s」可调用' % model if model else '') + ('（模型列表暂不可用，可手动填写模型名称）' if note else ''),
     })
 
 
 # ---------------------------------------------------------------------------
 # 数据源：同花顺 / Wind 的同步作业与幂等入库
 # ---------------------------------------------------------------------------
+@app.get('/api/system/menus', summary='菜单显示设置（仅管理员）')
+def get_menu_settings(request: Request, session: Session = Depends(get_db)):
+    user = context_of(request, session)['u']
+    if user.role != 'admin':
+        raise ApiError(403, '仅管理员可管理菜单')
+    return _json(menu_settings.read(session))
+
+
+@app.post('/api/system/menus', summary='保存菜单显示设置（仅管理员）')
+async def post_menu_settings(request: Request, session: Session = Depends(get_db)):
+    user = context_of(request, session)['u']
+    if user.role != 'admin':
+        raise ApiError(403, '仅管理员可管理菜单')
+    data = await payload(request)
+    result, status = menu_settings.save(session, data, stamp())
+    session.commit()
+    return _json(result, status)
+
+
 @app.get('/api/data/sources', summary='数据来源状态、可选指标与最近同步作业')
 def get_data_sources(request: Request, session: Session = Depends(get_db)):
     user = resolve_user(session, _pick_token(request.cookies))
@@ -933,9 +1021,34 @@ def dispatch(context: dict, path: str, data: dict):
     """
     s, user = context['s'], context['u']
 
+    # A report document contains all chapters. Reserve its database write lock
+    # before reading it, so another saver reads our committed chapter changes.
+    # This works across worker processes; stale revisions are checked afterwards.
+    report_writes = {
+        '/api/chapter/save', '/api/chapter/submit', '/api/chapter/reopen',
+        '/api/chapters', '/api/report-info', '/api/personal-save',
+        '/api/save', '/api/refresh', '/api/transition', '/api/convert',
+        '/api/report-delete', '/api/report-withdraw', '/api/report-schedule', '/api/report-template-sync',
+    }
+    if path in report_writes and data.get('id'):
+        s.execute(update(Report).where(Report.id == int(data['id']))
+                  .values(version=Report.version).execution_options(synchronize_session=False))
+        s.expire_all()
+    elif path == '/api/reports' and data.get('category_id'):
+        # Number allocation and initial snapshots must also see preceding creates.
+        s.execute(update(database.Category).where(database.Category.id == int(data['category_id']))
+                  .values(revision=database.Category.revision).execution_options(synchronize_session=False))
+        s.expire_all()
+
     result = iam.handle(s, path, data, user, stamp, password)
     if result is not None:
         return result
+
+    if path == '/api/report-template-sync':
+        report = s.get(Report, int(data.get('id') or 0))
+        if not report or not manual.can_view(s, report, user):
+            return {'error': '无权访问此报告'}, 403
+        return report_templates.apply(s, report, data, user, stamp, snapshot, event)
 
     if path == '/api/report-schedule':
         return schedule_report(s, data, user)
@@ -1028,6 +1141,7 @@ def report_lifecycle(s: Session, path: str, data: dict, user):
     if not note:
         return {'error': '撤销原因必填'}, 400
     report.status = '已退回'
+    report.scheduled_at = ''
     report.workflow_state = engine.dump({'index': 0, 'approvals': []})
     report.updated = stamp()
     event(s, report, user, '撤销发布/审批', note)
@@ -1101,6 +1215,8 @@ def transition(s: Session, report, data: dict, user):
             target = '已发布'
     if not target:
         return {'error': '角色或当前状态不允许该操作；作者不能审核或发布自己的报告'}, 403
+    if action in ['提交', '退回']:
+        report.scheduled_at = ''
     report.status = target
     report.updated = stamp()
     event(s, report, user, action, note)
@@ -1112,18 +1228,22 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + '…'
 
 
-def _ai_provider() -> str:
+def _ai_provider(s: Session | None = None) -> str:
     """模型通道：openai（任何 OpenAI 兼容 /chat/completions）或 codebuddy-cli（本机 CodeBuddy 命令行）。
 
     CodeBuddy 的密钥只对 CLI/IDE/SDK 有效，官方没有开放 OpenAI 兼容端点，
     所以这类密钥只能经 CLI 转换；本函数把它隔离在一个分支里，其余代码不受影响。
     """
-    return (os.getenv('AI_PROVIDER') or 'openai').strip().lower()
+    profile = ai_profiles.active(s) if s is not None else None
+    return profile['provider'] if profile else (os.getenv('AI_PROVIDER') or 'openai').strip().lower()
 
 
 def _ai_base(s: Session) -> str:
     """接口地址：设置页保存的值优先，其次环境变量 AI_BASE_URL。"""
-    return (_setting(s, 'ai_base_url') or os.getenv('AI_BASE_URL', 'https://api.openai.com/v1')).rstrip('/')
+    profile = ai_profiles.active(s)
+    if profile is not None:
+        return profile['base_url']
+    return _legacy_ai_profile(s)['base_url']
 
 
 def _ai_key(s: Session) -> str:
@@ -1131,8 +1251,10 @@ def _ai_key(s: Session) -> str:
 
     密钥只在服务端使用，任何接口都不返回明文。
     """
-    return (_setting(s, 'ai_api_key') or os.getenv('AI_API_KEY')
-            or os.getenv('CODEBUDDY_API_KEY') or '')
+    profile = ai_profiles.active(s)
+    if profile is not None:
+        return profile['api_key']
+    return _legacy_ai_profile(s)['api_key']
 
 
 def _mask_key(key: str) -> str:
@@ -1164,7 +1286,10 @@ def _put_setting(s: Session, key: str, value: str, at: str) -> None:
 
 def _ai_model(s: Session) -> str:
     """当前生效模型：设置页保存的值优先，其次环境变量 AI_MODEL。"""
-    return _setting(s, 'ai_model') or (os.getenv('AI_MODEL') or '').strip()
+    profile = ai_profiles.active(s)
+    if profile is not None:
+        return profile['model']
+    return _legacy_ai_profile(s)['model']
 
 
 def _upstream_models(base: str, key: str) -> tuple[list[str], str]:
@@ -1172,7 +1297,7 @@ def _upstream_models(base: str, key: str) -> tuple[list[str], str]:
     request = urllib.request.Request(base.rstrip('/') + '/models',
                                      headers={'Authorization': 'Bearer ' + key})
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=8, context=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)) as response:
             body = json.load(response)
     except urllib.error.HTTPError as exc:
         # 真正有用的信息在响应体里；至少把状态码翻译成人话，别直接甩英文异常
@@ -1203,7 +1328,7 @@ _MODELS_CACHE: dict[str, Any] = {'slot': '', 'models': []}
 
 def _models_slot(base: str, key: str) -> str:
     """缓存键带上密钥指纹：换地址或换密钥后旧列表自然不再命中。"""
-    return base + '|' + _mask_key(key)
+    return base + '|' + hashlib.sha256(key.encode()).hexdigest()
 
 
 def _remember_models(base: str, key: str, models: list[str]) -> None:
@@ -1232,7 +1357,7 @@ def _ask_openai(prompt: str, key: str, model: str, base: str, max_tokens: int | 
                          'temperature': 0.2}).encode(),
         headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(api_request, timeout=int(os.getenv('AI_TIMEOUT', '180'))) as response:
+        with urllib.request.urlopen(api_request, timeout=int(os.getenv('AI_TIMEOUT', '180')), context=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)) as response:
             result = json.load(response)
     except urllib.error.HTTPError as exc:
         # 余额不足、模型不存在这类问题，真正有用的信息在响应体里，不能只报 "HTTP Error 402"
@@ -1354,7 +1479,7 @@ def _ask_model(provider: str, prompt: str, key: str, model: str, base: str, max_
 def generate(s: Session, report, data: dict, user):
     if (not report['metadata'] and report['author'] != user['id']) or report['status'] not in ['草稿', '已退回']:
         return {'error': '当前账号无权生成草稿'}, 403
-    provider = _ai_provider()
+    provider = _ai_provider(s)
     key = _ai_key(s)
     model = _ai_model(s)
     base = _ai_base(s)
@@ -1372,7 +1497,7 @@ def generate(s: Session, report, data: dict, user):
             return {'error': '请选择要生成的章节'}, 400
     evidence, words = _section_evidence(s, report, section)
     if not evidence:
-        return {'error': '还没有可用的研究数据：请先在「数据管理 → 手工数据录入」导入 CSV（来源/指标/日期/数值/单位）后再生成草稿'}, 400
+        return {'error': '还没有可用的研究数据：请先在「数据管理 → 数据录入」导入 CSV（来源/指标/日期/数值/单位）后再生成草稿'}, 400
     prompt = _section_prompt(report, section, evidence, words)
 
     started = time.time()
@@ -1395,36 +1520,38 @@ def generate(s: Session, report, data: dict, user):
 
 
 def save_ai_config(s: Session, data: dict, user, at: str):
-    """保存外部模型配置：模型、接口地址、密钥。
-
-    只更新请求里出现的字段；模型/地址传空字符串即回到环境变量默认。
-    密钥不回显，clear_key 用于清空（清空后回落到环境变量）。
-    """
+    """更新原有配置；先完整校验再写入，避免失败请求只保存了一半字段。"""
     if user['role'] != 'admin':
         return {'error': '仅管理员可配置外部模型'}, 403
+    changes = {}
     if 'model' in data:
         model = str(data.get('model') or '').strip()
         if len(model) > 80:
             return {'error': '模型名称过长（最多 80 字符）'}, 400
-        _put_setting(s, 'ai_model', model, at)
+        changes['ai_model'] = model
     if 'base_url' in data:
         base = str(data.get('base_url') or '').strip().rstrip('/')
         if len(base) > 200:
             return {'error': '接口地址过长（最多 200 字符）'}, 400
-        if base and (not (base.startswith('http://') or base.startswith('https://')) or ' ' in base):
-            return {'error': '接口地址需以 http:// 或 https:// 开头且不含空格'}, 400
-        _put_setting(s, 'ai_base_url', base, at)
+        if base:
+            ai_profiles.valid_base(base)
+        changes['ai_base_url'] = base
+        previous = _legacy_ai_profile(s)
+        effective = base or os.getenv('AI_BASE_URL', 'https://api.openai.com/v1').rstrip('/')
+        if effective != previous['base_url'] and previous['api_key'] and not str(data.get('api_key') or '').strip() and not data.get('clear_key'):
+            return {'error': '修改接口地址时请重新填写密钥'}, 400
     if data.get('clear_key'):
-        _put_setting(s, 'ai_api_key', '', at)
+        changes['ai_api_key'] = ''
     elif str(data.get('api_key') or '').strip():
-        key = str(data.get('api_key')).strip()
-        if len(key) > 200:
-            return {'error': '密钥过长（最多 200 字符）'}, 400
-        if any(ch.isspace() for ch in key):
-            return {'error': '密钥里不应包含空格或换行'}, 400
-        _put_setting(s, 'ai_api_key', key, at)
+        key = str(data['api_key']).strip()
+        if len(key) > 200 or any(ch.isspace() for ch in key):
+            return {'error': '密钥最多 200 字符，不应包含空格或换行'}, 400
+        changes['ai_api_key'] = key
+    for key, value in changes.items():
+        _put_setting(s, key, value, at)
     # 删除是延迟到提交才生效，先 flush 再回读，否则快照里还会看到刚清掉的密钥
     s.flush()
+    s.info.pop('legacy_ai_profile', None)
     current = _ai_key(s)
     # 地址或密钥变了，之前缓存的模型列表就不作数了，否则下拉里会出现别的网关的模型
     if _MODELS_CACHE['slot'] != _models_slot(_ai_base(s), current):
@@ -1439,7 +1566,7 @@ def save_ai_config(s: Session, data: dict, user, at: str):
 # ---------------------------------------------------------------------------
 POST_PATHS = (
     '/api/password', '/api/users', '/api/departments', '/api/roles', '/api/approval-flows',
-    '/api/report-schedule', '/api/library', '/api/library/batch',
+    '/api/report-schedule', '/api/report-template-sync', '/api/library', '/api/library/batch',
     '/api/report-view', '/api/report-delete', '/api/report-withdraw',
     '/api/catalog', '/api/category-tree', '/api/categories', '/api/reports',
     '/api/personal-save', '/api/report-info', '/api/chapters', '/api/chapter/reopen',

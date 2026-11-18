@@ -23,7 +23,7 @@ export const MENU = [
   { label: '审批管理', icon: Finished, children: [{ label: '审批列表', path: '/approval' }] },
   {
     label: '数据源', icon: DataLine, children: [
-      { label: '手工数据录入', path: '/data' },
+      { label: '数据录入', path: '/data' },
       { label: '指标查询', path: '/data/indicators' },
     ],
   },
@@ -76,9 +76,11 @@ export const MENU = [
   {
     label: '系统设置', icon: Setting, admin: true, children: [
       { label: '部门管理', path: '/system/departments', admin: true },
+      { label: '账号管理', path: '/system/users', admin: true },
       { label: '角色管理', path: '/system/roles', admin: true },
-      { label: '审批流配置', path: '/config/flows', admin: true },
-      { label: '基本配置', path: '/system/settings', admin: true },
+      { label: '审批流设置', path: '/config/flows', admin: true },
+      { label: '外部模型', path: '/system/models', admin: true },
+      { label: '菜单管理', path: '/system/menus', admin: true },
     ],
   },
 ];
@@ -97,4 +99,35 @@ export function breadcrumb(path) {
 export function pageTitle(path) {
   const parts = breadcrumb(path);
   return parts[parts.length - 1];
+}
+
+/* Stable identifiers use route paths where available; placeholder modules use their hierarchy. */
+export function menuId(item, parent = null) {
+  return item.path || (parent ? `item:${parent.label}:${item.label}` : `group:${item.label}`);
+}
+
+export const PROTECTED_MENU_IDS = ['group:系统设置', '/system/menus'];
+const PERMISSIONS = {
+  '/reports': '研报中心', '/approval': '审核中心',
+  '/data': '数据中心', '/data/indicators': '数据中心',
+  '/library/cloud': '云盘', '/library/docs': '文档管理库', '/library/materials': '素材库',
+  '/config/categories': '分类配置', '/config/authors': '作者管理',
+  '/config/commodities': '品种管理', '/config/flows': '审批流配置',
+  '/system/departments': '部门管理', '/system/users': '系统管理', '/system/roles': '角色管理',
+  '/system/models': '系统管理', '/system/settings': '系统管理', '/system/menus': '系统管理',
+};
+
+export function filterMenu(items, account, visibility = {}) {
+  const admin = account.role === 'admin';
+  const permissions = account.menus || [];
+  const shown = (item, parent) => {
+    const id = menuId(item, parent);
+    if (item.admin && !admin) return false;
+    if (!PROTECTED_MENU_IDS.includes(id) && visibility[id] === false) return false;
+    const permission = PERMISSIONS[item.path];
+    return admin || !permission || permissions.includes('*') || permissions.includes(permission);
+  };
+  return items.filter(item => shown(item)).map(item => item.children
+    ? { ...item, children: item.children.filter(child => shown(child, item)) } : item
+  ).filter(item => !item.children || item.children.length);
 }

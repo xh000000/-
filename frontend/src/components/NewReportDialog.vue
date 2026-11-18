@@ -118,7 +118,7 @@
       <div v-if="sectionPreview.length" class="template-preview">
         <div class="tp-head">
           <b>章节结构</b>
-          <span class="caption">按《兴业期货日度策略》合集组织，创建后按章分工</span>
+          <span class="caption">{{ form.mode === 'inherit' ? '沿用原报告模板与章节，创建后按章分工' : '按所选分类模板生成，创建后按章分工' }}</span>
         </div>
         <ul class="tp-list">
           <li
@@ -201,7 +201,7 @@ const bylineOptions = computed(() => {
 const commodityOptions = computed(() => {
   const names = currentCategory.value?.config?.commodities || [];
   return names
-    .map(name => commodities.value.find(item => item.name === name && item.enabled))
+    .map(name => commodities.value.find(item => item.name === name && item.enabled && (!item.parent_id || commodities.value.some(parent => parent.id === item.parent_id && parent.enabled))))
     .filter(Boolean)
     .map(item => ({
       name: item.name,
@@ -217,12 +217,17 @@ const inheritOptions = computed(() =>
 );
 
 const collaboratorOptions = computed(() =>
-  members.value.filter(item => item.id !== user.value.id && ['researcher', 'admin'].includes(item.role))
+  members.value.filter(item => item.id !== user.value.id && item.enabled !== 0 && ['researcher', 'admin'].includes(item.role))
 );
 
 /* 章节结构预览：一级章节与二级板块按合集层级展开，不写入正文。 */
 const sectionPreview = computed(() => {
-  const list = currentCategory.value?.config?.sections || [];
+  let config = currentCategory.value?.config;
+  if (form.mode === 'inherit') {
+    const source = inheritOptions.value.find(item => item.id === form.inherit_id);
+    try { config = JSON.parse(source?.config_snapshot || 'null') || config; } catch { /* fallback to the category */ }
+  }
+  const list = config?.sections || [];
   const out = [];
   let group = null;
   list.forEach((item, index) => {
@@ -240,6 +245,9 @@ const sectionPreview = computed(() => {
 });
 
 function onOpen() {
+  form.title = '';
+  form.byline_id = null;
+  form.commodity = '';
   form.mode = 'new';
   form.inherit_id = null;
   form.summary = '';
@@ -254,6 +262,9 @@ function onOpen() {
 
 function onModeChange() {
   if (form.mode !== 'inherit') form.inherit_id = null;
+  else if (!inheritOptions.value.some(item => item.id === form.inherit_id)) {
+    form.inherit_id = inheritOptions.value[0]?.id ?? null;
+  }
 }
 
 function syncTitle() {
@@ -284,10 +295,14 @@ function syncCategory() {
 }
 
 async function submit() {
+  if (saving.value) return;
   if (!form.category_id) return ElMessage.warning('请选择报告分类');
   if (!form.title.trim()) return ElMessage.warning('请填写报告标题');
   if (!form.byline_id) return ElMessage.warning('请先在作者管理中添加可用署名作者');
-  if (form.mode === 'inherit' && !form.inherit_id) return ElMessage.warning('该分类暂无可继承的已发布报告');
+  if (!form.commodity) return ElMessage.warning('请选择研究品种');
+  if (!form.report_date) return ElMessage.warning('请选择创建日期');
+  if (form.collaboration === 'shared' && !form.collaborators.length) return ElMessage.warning('请选择至少一名协作人');
+  if (form.mode === 'inherit' && !inheritOptions.value.some(item => item.id === form.inherit_id)) return ElMessage.warning('该分类暂无可继承的已发布报告');
   saving.value = true;
   try {
     const result = await api('reports', {
@@ -296,7 +311,7 @@ async function submit() {
       title: form.title.trim(),
       summary: form.summary,
       byline_id: form.byline_id,
-      report_date: form.report_date || today(),
+      report_date: form.report_date,
       commodity: form.commodity,
       collaboration: form.collaboration,
       collaborators: form.collaboration === 'shared' ? form.collaborators : [],
