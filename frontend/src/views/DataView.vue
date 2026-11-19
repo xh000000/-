@@ -39,8 +39,8 @@
         </div>
         <p class="caption src-channel">{{ source.channel || '未填写取数通道说明' }}</p>
         <div class="source-actions">
-          <el-button type="primary" size="small" :disabled="!canSync || !source.enabled || ['ifind', 'wind'].includes(source.key) || syncingSource === source.key" :loading="syncingSource === source.key" @click.stop="openSync(source)">
-            同步数据
+          <el-button type="primary" size="small" :disabled="!canSync || !source.enabled || syncingSource === source.key" :loading="syncingSource === source.key" @click.stop="openSync(source)">
+            {{ sourceHasConfig(source) ? '同步数据' : '登记同步' }}
           </el-button>
           </div><div class="source-last-sync">上次同步 <span>{{ localTime(source.last_sync) }}</span>
         </div>
@@ -199,19 +199,40 @@
       </p>
     </el-drawer>
 
-    <el-dialog v-model="syncVisible" :title="`${activeSource?.name || ''} · 同步数据`" width="540px">
-      <el-alert type="info" :closable="false" show-icon title="立即连接数据接口，按所选配置获取并入库；不会仅登记待执行任务。" />
+    <el-dialog v-model="syncVisible" :title="`${activeSource?.name || ''} · ${syncMode === 'register' ? '登记同步' : '同步数据'}`" width="560px" @closed="resetSync">
+      <el-alert v-if="syncMode === 'run'" type="info" :closable="false" show-icon title="立即连接数据接口，按所选配置获取并入库；不会仅登记待执行任务。" />
+      <el-alert v-else type="info" :closable="false" show-icon title="此来源的凭据由已授权通道持有，页面登记同步范围后即可执行；结果见「同步记录」。" />
       <el-form label-width="90px" style="margin-top: 20px">
-        <el-form-item label="同步配置">
-          <el-select v-model="syncConfigId" placeholder="选择配置" style="width: 100%">
-            <el-option v-for="item in activeSyncConfigs" :key="item.id" :label="item.name" :value="item.id" />
-          </el-select>
-        </el-form-item>
+        <template v-if="syncMode === 'run'">
+          <el-form-item label="同步配置">
+            <el-select v-model="syncConfigId" placeholder="选择配置" style="width: 100%">
+              <el-option v-for="item in activeSyncConfigs" :key="item.id" :label="item.name" :value="item.id" />
+            </el-select>
+          </el-form-item>
+        </template>
+        <template v-else>
+          <el-form-item label="品种/指标">
+            <el-select v-model="regItems" multiple filterable allow-create default-first-option :placeholder="scopePlaceholder" style="width: 100%">
+              <el-option v-for="item in scopeOptions" :key="item" :label="item" :value="item" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="取数指标">
+            <el-select v-model="regMetrics" multiple :placeholder="activeSource?.key === 'ifind' ? '行情至少选一个' : '可留空'" style="width: 100%">
+              <el-option v-for="item in metrics" :key="item.key" :label="item.label" :value="item.key" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="区间">
+            <el-input-number v-model="regDays" :min="1" :max="120" controls-position="right" />
+            <span class="caption" style="margin-left: 8px">个交易日</span>
+          </el-form-item>
+        </template>
       </el-form>
-      <p v-if="selectedSyncConfig" class="caption">范围：{{ configScope(selectedSyncConfig) }}</p>
+      <p v-if="syncMode === 'run' && selectedSyncConfig" class="caption">范围：{{ configScope(selectedSyncConfig) }}</p>
+      <p v-else-if="syncMode === 'register'" class="caption">登记后作业进入「待执行」，由已授权通道取数回填，可在「同步记录」查看进度。</p>
       <template #footer>
         <el-button @click="syncVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" :disabled="!syncConfigId" @click="submitSync">立即同步</el-button>
+        <el-button v-if="syncMode === 'run'" type="primary" :loading="submitting" :disabled="!syncConfigId" @click="submitSync">立即同步</el-button>
+        <el-button v-else type="primary" :loading="submitting" :disabled="!regItems.length" @click="submitSync">登记同步</el-button>
       </template>
     </el-dialog>
 
@@ -457,7 +478,6 @@ const settingsSource = ref(null);
 const sourceConfigs = computed(() => configs.value.filter(item => item.source === settingsSource.value?.key));
 function sourceStatus(source) {
   if (!source.enabled) return { label: '已停用', type: 'info' };
-  if (['ifind', 'wind'].includes(source.key)) return { label: '暂不取数', type: 'info' };
   const related = configs.value.filter(item => item.source === source.key);
   if (related.some(item => item.last_status === '失败')) return { label: '同步失败', type: 'danger' };
   return { label: source.rows ? '已同步' : '待同步', type: source.rows ? 'success' : 'info' };
@@ -479,6 +499,11 @@ const submitting = ref(false);
 const activeSource = ref(null);
 const syncingSource = ref('');
 const syncConfigId = ref(null);
+/* run：来源已有接口配置，点一下直接取数；register：凭据在已授权通道，页面只登记范围 */
+const syncMode = ref('run');
+const regItems = ref([]);
+const regMetrics = ref([]);
+const regDays = ref(10);
 const activeSyncConfigs = computed(() => configs.value.filter(item => item.source === activeSource.value?.key && item.enabled));
 const selectedSyncConfig = computed(() => activeSyncConfigs.value.find(item => item.id === syncConfigId.value));
 const configMetrics = computed(() => configForm.kind === 'eastmoney_snapshot'
@@ -638,23 +663,64 @@ function openJob(row) {
   jobVisible.value = true;
 }
 
-/* ---------- 页面登记同步（由已授权通道回填） ---------- */
+/* ---------- 同步：有接口配置直接取数，否则登记范围由已授权通道回填 ---------- */
+function sourceHasConfig(source) {
+  return configs.value.some(item => item.source === source.key && item.enabled);
+}
+
 function openSync(source) {
-  if (['ifind', 'wind'].includes(source.key)) {
-    ElMessage.info('此数据源暂不取数，可点击卡片维护配置');
-    return;
-  }
   activeSource.value = source;
-  syncConfigId.value = activeSyncConfigs.value[0]?.id || null;
-  if (!syncConfigId.value) {
-    ElMessage.info('请先为此数据源创建并启用接口配置');
-    if (canConfig.value) openSourceSettings(source);
-    return;
+  if (sourceHasConfig(source)) {
+    syncMode.value = 'run';
+    syncConfigId.value = activeSyncConfigs.value[0]?.id || null;
+  } else {
+    syncMode.value = 'register';
+    syncConfigId.value = null;
+    /* 默认沿用上一次同来源的登记范围，避免每次重新挑品种 */
+    const last = jobs.value.find(item => item.source === source.key && item.scope?.items?.length);
+    regItems.value = last ? [...last.scope.items]
+      : source.scope_mode === 'custom' && source.scope_items?.length ? [...source.scope_items] : [];
+    regMetrics.value = last?.scope?.metrics?.length ? [...last.scope.metrics]
+      : source.key === 'ifind' ? ['close', 'settle', 'volume', 'open_interest'] : [];
+    regDays.value = last?.scope?.days || 10;
   }
   syncVisible.value = true;
 }
 
+function resetSync() {
+  syncMode.value = 'run';
+  syncConfigId.value = null;
+  regItems.value = [];
+  regMetrics.value = [];
+  regDays.value = 10;
+}
+
 async function submitSync() {
+  if (syncMode.value === 'register') {
+    if (!regItems.value.length) return ElMessage.warning('请至少选择一个品种或指标');
+    if (activeSource.value?.key === 'ifind' && !regMetrics.value.length) {
+      return ElMessage.warning('同花顺行情至少要选一个指标');
+    }
+    submitting.value = true;
+    syncingSource.value = activeSource.value.key;
+    try {
+      await api('data/jobs', {
+        source: activeSource.value.key,
+        items: regItems.value,
+        metrics: regMetrics.value,
+        days: regDays.value,
+      });
+      ElMessage.success('已登记同步作业，结果见「同步记录」');
+      syncVisible.value = false;
+      await load();
+    } catch (error) {
+      ElMessage.error(error.message || '登记失败');
+    } finally {
+      submitting.value = false;
+      syncingSource.value = '';
+    }
+    return;
+  }
   if (!selectedSyncConfig.value) return ElMessage.warning('请选择启用的同步配置');
   submitting.value = true;
   syncingSource.value = activeSource.value.key;
