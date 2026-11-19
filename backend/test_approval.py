@@ -1,4 +1,4 @@
-import json,os,sys,sqlite3,subprocess,threading,unittest
+import json,os,sys,contextlib,sqlite3,subprocess,threading,unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from test_report_creation import ReportCreation
@@ -80,7 +80,7 @@ class ApprovalChecks(ReportCreation):
   payload={'id':rid,'action':'发布','expected_status':r['status'],'expected_workflow':r['workflow_state']};barrier=threading.Barrier(2)
   with ThreadPoolExecutor(2) as pool:responses=list(pool.map(send,[(c,payload) for c in [self.clients['create-publisher'],self.clients['publish2']]]))
   self.assertEqual(sorted(x[0] for x in responses),[200,409],responses)
-  with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],1)
+  with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],1)
   print('并发会签与并发发布通过',flush=True)
  def test_flow_snapshot_and_validation(self):
   self.assertEqual(self.flow('any')[0],200);old=self.prepared()
@@ -98,10 +98,10 @@ class ApprovalChecks(ReportCreation):
   self.assertEqual(self.call(publisher,'report-schedule',{'id':rid,'at':''})[0],200)
   self.assertFalse(self.report(rid)['scheduled_at'])
   self.call(publisher,'report-schedule',{'id':rid,'at':'2030-01-01T09:00'})
-  with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,))
+  with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,));db.commit()
   subprocess.run([sys.executable,'-c','from app import publish_due; publish_due(); publish_due()'],cwd='backend',env={**os.environ,'DATA_DIR':self.tmp.name},check=True)
   self.assertEqual(self.report(rid)['status'],'已发布')
-  with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],1)
+  with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],1)
   print('定时发布、取消与重复扫描通过',flush=True)
  def test_disabled_approver(self):
   status,res=self.flow('all',[self.ids['review-disabled']])
@@ -118,7 +118,7 @@ class ApprovalChecks(ReportCreation):
   r=self.report(rid);print('撤销审批后状态:',r['status'],'残留定时:',r['scheduled_at'],flush=True)
   self.assertFalse(r['scheduled_at'],'撤销审批应取消旧版本的发布预约')
   # Pre-existing returned reports may still carry an appointment from the old version.
-  with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,))
+  with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,));db.commit()
   self.assertEqual(self.transition(self.owner,rid,'提交')[0],200)
   self.assertFalse(self.report(rid)['scheduled_at'],'重新送审应清除旧库遗留预约')
   self.assertEqual(self.transition(self.clients['create-review'],rid,'通过')[0],200)
@@ -150,7 +150,7 @@ class ApprovalChecks(ReportCreation):
  def test_withdraw_beats_inflight_scheduler(self):
   import time
   rid=self.through();self.call(self.clients['create-publisher'],'report-schedule',{'id':rid,'at':'2030-01-01T09:00'})
-  with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,))
+  with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:db.execute("update reports set scheduled_at='2020-01-01 00:00:00 UTC' where id=?",(rid,));db.commit()
   ready=Path(self.tmp.name)/'scheduler-ready';resume=Path(self.tmp.name)/'scheduler-resume'
   code="""from pathlib import Path
 import os,time,app
@@ -173,7 +173,7 @@ app.publish_due()
    resume.touch();self.assertEqual(worker.wait(timeout=5),0)
    self.assertEqual(self.report(rid)['status'],'已退回')
    self.assertFalse(self.report(rid)['scheduled_at'])
-   with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],0)
+   with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:self.assertEqual(db.execute('select count(*) from publication_history where report_id=?',(rid,)).fetchone()[0],0)
   finally:
    resume.touch()
    if worker.poll() is None:worker.terminate();worker.wait()

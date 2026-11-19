@@ -1,4 +1,5 @@
 """Full acceptance chain with a real local HTTP model simulator and isolated DB."""
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -124,7 +125,7 @@ class FullWorkflow(Workflow):
         self.assertEqual([(e['actor'],e['action']) for e in sorted(approvals,key=lambda x:x['id'])],
                          [('验收作者','提交'),('验收复核','通过'),('验收合规','通过'),('验收发布','发布')])
         self.assertEqual(sum(e['action']=='生成AI候选草稿' for e in events),len(doc['sections']))
-        with sqlite3.connect(Path(self.tmp.name)/'research.db') as db:
+        with contextlib.closing(sqlite3.connect(Path(self.tmp.name)/'research.db')) as db:
             db.row_factory=sqlite3.Row;publications=db.execute('select * from publication_history where report_id=?',(rid,)).fetchall()
         self.assertEqual(len(publications),1);self.assertEqual(publications[0]['version'],2)
         self.assertEqual(json.loads(publications[0]['document']),json.loads(final['document']))

@@ -4,7 +4,7 @@ from pathlib import Path
 class Workflow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp=tempfile.TemporaryDirectory()
+        cls.tmp=tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         with socket.socket() as s:s.bind(('127.0.0.1',0)); cls.port=s.getsockname()[1]
         cls.proc=subprocess.Popen([sys.executable,str(Path(__file__).with_name('server.py'))],env={**os.environ,'DATA_DIR':cls.tmp.name,'PORT':str(cls.port)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         cls.base=f'http://127.0.0.1:{cls.port}/api/'
@@ -12,7 +12,14 @@ class Workflow(unittest.TestCase):
             try:urllib.request.urlopen(cls.base+'bootstrap',timeout=1);break
             except Exception:time.sleep(.05)
     @classmethod
-    def tearDownClass(cls):cls.proc.terminate();cls.proc.wait();cls.tmp.cleanup()
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:cls.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:cls.proc.kill();cls.proc.wait(timeout=15)
+        # Windows 上进程刚退出时 sqlite 文件句柄可能还没释放，删不掉就稍等重试
+        for _ in range(20):
+            try:cls.tmp.cleanup();break
+            except OSError:time.sleep(.25)
     def client(self):return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
     def ensure_blocks(self,doc,text=''):
         """新报告章节不再自带空文字块；测试要写字时先补一个，避免依赖编辑器的默认组件。"""
