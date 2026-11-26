@@ -3,7 +3,7 @@
 闭环
 ----
 1. 研究员登记观点：品种、方向（看多/看空/震荡）、依据、基准价（自动取指标库最新价，
-   可手工覆盖）、观察期（1~90 自然日）；
+   历史记录保留，新记录从发布研报确认）、观察期（1~90 自然日）；
 2. 结算（回溯）：到期后取指标库该品种的价格（优先现货价 → 收盘价 → 结算价），
    对照基准价算区间涨跌幅，按 ±1% 阈值判「正确 / 错误 / 持平」，无价格数据则
    「无法结算」并保留原因——绝不编造结果；
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import time
 
 from fastapi import APIRouter, Depends, Request
@@ -30,6 +31,7 @@ DIRECTIONS = ('看多', '看空', '震荡')
 SETTLE_THRESHOLD = 1.0          # 涨跌幅阈值（%）：区间变化不超过 ±1% 计「持平」
 _PRICE_PREFERENCE = ('现货价', '收盘价', '结算价', '最新点位', '收盘点位')
 _MAX_BASIS = 1000
+MAX_PRICE_AGE_DAYS = 7
 
 
 def _stamp() -> str:
@@ -56,67 +58,78 @@ async def _body(request: Request) -> dict:
 # ---------------------------------------------------------------------------
 # 价格基准：从指标库取（确定性代码，不用 LLM）
 # ---------------------------------------------------------------------------
-def price_on(s, commodity: str, date: str) -> dict | None:
-    """该品种在指定日期（含）之前最近的入库价格；按指标类型优先级挑选。"""
-    rows = s.execute(
-        select(Observation.source, Observation.indicator, func.max(Observation.date))
-        .where(Observation.indicator.contains(commodity))
-        .group_by(Observation.source, Observation.indicator)).all()
+def price_on(s, commodity: str, date: str, *, source=None, indicator=None, unit=None) -> dict | None:
+    """只从已入库价格取值；锁定序列时绝不跨来源、跨指标回退。"""
+    target = datetime.date.fromisoformat(date)
+    query = select(Observation).where(Observation.date <= date + 'T23:59:59',
+        Observation.date >= (target - datetime.timedelta(days=MAX_PRICE_AGE_DAYS)).isoformat())
+    if source is not None and indicator is not None:
+        query = query.where(Observation.source == source, Observation.indicator == indicator)
+    else:
+        query = query.where(Observation.indicator.contains(commodity))
     candidates = []
-    for source, indicator, _latest in rows:
-        rank = next((i for i, key in enumerate(_PRICE_PREFERENCE)
-                     if indicator.endswith(key)), len(_PRICE_PREFERENCE))
-        candidates.append((rank, source, indicator))
-    candidates.sort()
-    best = None
-    for _rank, source, indicator in candidates:
-        points = [p for p in report_engine.resolve_data(s, source, indicator)
-                  if p.get('value') is not None and str(p.get('date', ''))[:10] <= date]
-        if not points:
-            continue
-        point = points[-1]
-        # 同优先级取日期更新的；不同优先级按 rank 胜出（现货价 > 收盘价 > …）
-        if best is None or (_rank == best[0] and point['date'] > best[1]['date']) or _rank < best[0]:
-            best = (_rank, point, indicator, source)
-    if best is None:
-        return None
-    return {'value': best[1]['value'], 'date': str(best[1]['date'])[:10],
-            'indicator': best[2], 'source': best[3]}
+    for row in s.execute(query).scalars():
+        rank = next((i for i, suffix in enumerate(_PRICE_PREFERENCE) if (row.indicator or '').endswith(suffix)), None)
+        if rank is None: continue  # 库存、开工率等非价格指标不能用于结算
+        try:
+            day = datetime.date.fromisoformat(str(row.date)[:10])
+            value = float(row.value)
+        except (TypeError, ValueError): continue
+        if not math.isfinite(value) or value <= 0 or not 0 <= (target-day).days <= MAX_PRICE_AGE_DAYS: continue
+        if unit is not None and (row.unit or '') != unit: continue
+        candidates.append((rank, -day.toordinal(), row.source or '', row.indicator or '', row.id, row))
+    if not candidates: return None
+    row = min(candidates, key=lambda x:x[:5])[-1]
+    return {'value': row.value, 'date': str(row.date)[:10], 'indicator': row.indicator,
+            'source': row.source, 'unit': row.unit or ''}
 
 
-def _outcome(direction: str, change_pct: float) -> str:
+def _outcome(direction: str, change_pct: float, threshold: float = SETTLE_THRESHOLD) -> str:
     if direction == '看多':
-        if change_pct >= SETTLE_THRESHOLD:
+        if change_pct >= threshold:
             return '正确'
-        if change_pct <= -SETTLE_THRESHOLD:
+        if change_pct <= -threshold:
             return '错误'
         return '持平'
     if direction == '看空':
-        if change_pct <= -SETTLE_THRESHOLD:
+        if change_pct <= -threshold:
             return '正确'
-        if change_pct >= SETTLE_THRESHOLD:
+        if change_pct >= threshold:
             return '错误'
         return '持平'
-    return '正确' if abs(change_pct) < SETTLE_THRESHOLD else '错误'
+    return '正确' if abs(change_pct) < threshold else '错误'
 
 
 def settle(s, vp: Viewpoint) -> bool:
     """到期自动结算；返回是否发生状态翻转。无价格数据标记「无法结算」。"""
     if vp.status != '在途' or not vp.expire_date or vp.expire_date > _today():
         return False
-    point = price_on(s, vp.commodity, vp.expire_date)
-    if point is None or vp.benchmark_price in (None, 0):
+    point = None
+    reason = ''
+    if not vp.benchmark_source or not vp.benchmark_indicator:
+        reason = '旧观点缺少锁定的价格来源或指标，无法安全比较价格数据，请重新登记'
+    elif vp.benchmark_price is None or not math.isfinite(vp.benchmark_price) or vp.benchmark_price <= 0:
+        reason = '缺少有效的正数基准价'
+    else:
+        point = price_on(s, vp.commodity, vp.expire_date, source=vp.benchmark_source,
+                         indicator=vp.benchmark_indicator, unit=vp.benchmark_unit or '')
+        if point is None:
+            reason = '锁定指标在结算日前 %s 个自然日内没有同来源、同单位的有效价格数据' % MAX_PRICE_AGE_DAYS
+        elif point['date'] <= vp.benchmark_date:
+            reason = '结算价格日期未晚于基准日期，缺少新的价格数据'
+    if reason:
         vp.outcome = '无法结算'
-        vp.note = ('缺少基准价' if vp.benchmark_price in (None, 0)
-                   else '指标库中没有该品种在结算日前可用的价格数据')
+        vp.note = reason
         vp.status = '已结算'
         vp.settled_at = _stamp()
         return True
     change = round((point['value'] - vp.benchmark_price) / vp.benchmark_price * 100, 2)
+    vp.result_source = point['source']
+    vp.result_indicator = point['indicator']
     vp.result_price = point['value']
     vp.result_date = point['date']
     vp.change_pct = change
-    vp.outcome = _outcome(vp.direction or '', change)
+    vp.outcome = _outcome(vp.direction or '', change, vp.evaluation_threshold or SETTLE_THRESHOLD)
     vp.note = '基准指标：%s（%s，来源 %s）' % (point['indicator'], point['date'], point['source'])
     vp.status = '已结算'
     vp.settled_at = _stamp()
@@ -147,51 +160,18 @@ def list_viewpoints(request: Request, session: Session = Depends(get_session)):
     _auth(request, session)
     settle_due(session)
     rows = session.execute(select(Viewpoint).order_by(Viewpoint.id.desc())).scalars().all()
+    import manual_engine
+    from db import Report
+    user = _auth(request, session)
+    rows = [x for x in rows if not x.report_id or ((report := session.get(Report, x.report_id)) and manual_engine.can_view(session, report, user))]
     return {'items': [_dict(x) for x in rows], 'threshold': SETTLE_THRESHOLD}
 
 
-@router.post('', summary='登记一条研究观点')
+@router.post('', summary='原手工登记入口已停用')
 async def create_viewpoint(request: Request, session: Session = Depends(get_session)):
     import app as platform
-    user = _auth(request, session)
-    if user['role'] not in ('admin', 'researcher'):
-        raise platform.ApiError(403, '仅研究人员与管理员可登记观点')
-    data = await _body(request)
-    commodity = str(data.get('commodity') or '').strip()
-    direction = str(data.get('direction') or '').strip()
-    basis = str(data.get('basis') or '').strip()[:_MAX_BASIS]
-    horizon = int(data.get('horizon_days') or 5)
-    if direction not in DIRECTIONS:
-        raise platform.ApiError(400, '方向必须是：' + '、'.join(DIRECTIONS))
-    row = session.execute(select(Commodity).where(Commodity.name == commodity)).scalars().first()
-    if not row:
-        raise platform.ApiError(400, '品种不存在：' + commodity)
-    if not 1 <= horizon <= 90:
-        raise platform.ApiError(400, '观察期需在 1~90 个自然日之间')
-
-    benchmark_date = _today()
-    point = price_on(session, commodity, benchmark_date)
-    benchmark_price = data.get('benchmark_price')
-    if benchmark_price in (None, ''):
-        if point is None:
-            raise platform.ApiError(400, '指标库中没有该品种的价格数据，请手工填写基准价')
-        benchmark_price = point['value']
-    else:
-        try:
-            benchmark_price = float(benchmark_price)
-        except Exception:
-            raise platform.ApiError(400, '基准价需为数字')
-        point = None
-    expire = (datetime.date.today() + datetime.timedelta(days=horizon)).isoformat()
-    vp = Viewpoint(user_id=user['id'], user_name=user['name'], commodity=commodity,
-                   direction=direction, basis=basis,
-                   benchmark_price=benchmark_price, benchmark_date=benchmark_date,
-                   horizon_days=horizon, expire_date=expire,
-                   benchmark_indicator=point['indicator'] if point else '（手工填写）',
-                   status='在途', created_at=_stamp())
-    session.add(vp)
-    session.commit()
-    return {'item': _dict(vp)}
+    _auth(request, session)
+    raise platform.ApiError(400, '请从已发布研报的候选观点确认入库，不再接受手工登记或手工价格')
 
 
 @router.post('/settle', summary='立即结算一条观点（不足观察期也可提前对照当前价）')
@@ -202,6 +182,8 @@ async def settle_viewpoint(request: Request, session: Session = Depends(get_sess
     vp = session.get(Viewpoint, int(data.get('id') or 0))
     if not vp:
         raise platform.ApiError(404, '观点不存在')
+    if vp.report_id and vp.status == '在途' and request.url.path.endswith('/settle'):
+        raise platform.ApiError(400, '研报观点按发布时的观察期到期结算，不支持提前结算')
     if vp.user_id != user['id'] and user['role'] != 'admin':
         raise platform.ApiError(403, '仅本人或管理员可结算')
     if vp.status != '在途':
@@ -223,8 +205,12 @@ async def delete_viewpoint(request: Request, session: Session = Depends(get_sess
     vp = session.get(Viewpoint, int(data.get('id') or 0))
     if not vp:
         raise platform.ApiError(404, '观点不存在')
+    if vp.report_id and vp.status == '在途' and request.url.path.endswith('/settle'):
+        raise platform.ApiError(400, '研报观点按发布时的观察期到期结算，不支持提前结算')
     if vp.user_id != user['id'] and user['role'] != 'admin':
         raise platform.ApiError(403, '仅本人或管理员可删除')
+    if vp.report_id:
+        raise platform.ApiError(400, '研报跟踪记录保留复盘依据，不支持删除')
     session.delete(vp)
     session.commit()
     return {'ok': True}
@@ -235,6 +221,10 @@ def viewpoint_stats(request: Request, session: Session = Depends(get_session)):
     _auth(request, session)
     settle_due(session)
     rows = session.execute(select(Viewpoint).where(Viewpoint.status == '已结算')).scalars().all()
+    from db import Report
+    import manual_engine
+    user = _auth(request, session)
+    rows = [x for x in rows if not x.report_id or ((report := session.get(Report, x.report_id)) and manual_engine.can_view(session, report, user))]
     settled = [x for x in rows if x.outcome in ('正确', '错误', '持平')]
 
     def bucket(key_of):
@@ -250,10 +240,11 @@ def viewpoint_stats(request: Request, session: Session = Depends(get_session)):
             b['accuracy'] = round(b['正确'] / b['total'] * 100, 1) if b['total'] else None
         return out
 
+    pending_rows = session.execute(select(Viewpoint).where(Viewpoint.status == '在途')).scalars().all()
+    pending = sum(1 for x in pending_rows if not x.report_id or ((r := session.get(Report, x.report_id)) and manual_engine.can_view(session, r, user)))
     return {
         'overall': {'settled': len(settled),
-                    'pending': int(session.execute(select(func.count()).select_from(Viewpoint)
-                                                   .where(Viewpoint.status == '在途')).scalar()),
+                    'pending': pending,
                     'unavailable': len([x for x in rows if x.outcome == '无法结算']),
                     'accuracy': (round(len([x for x in settled if x.outcome == '正确'])
                                        / len(settled) * 100, 1) if settled else None),

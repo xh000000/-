@@ -10,8 +10,10 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 
-os.environ['DATA_DIR'] = tempfile.mkdtemp()          # 必须在导入 db 之前设置
+from test_environment import prepare
+prepare()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
@@ -83,16 +85,16 @@ class ViewpointTests(unittest.TestCase):
         today = datetime.date.today().isoformat()
         with SessionFactory() as s:
             up = Viewpoint(user_id=self.user_id, user_name='张研究员', commodity='螺纹钢', direction='看多',
-                           basis='旺季需求回升', benchmark_price=3900, benchmark_date=today,
-                           horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价',
+                           basis='旺季需求回升', benchmark_price=3900, benchmark_date=(datetime.date.today()-datetime.timedelta(days=1)).isoformat(),
+                           horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价', benchmark_source='钢联', benchmark_unit='元/吨',
                            status='在途', created_at='now')
             down = Viewpoint(user_id=self.user_id, user_name='张研究员', commodity='螺纹钢', direction='看空',
-                             basis='库存累积', benchmark_price=3900, benchmark_date=today,
-                             horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价',
+                             basis='库存累积', benchmark_price=3900, benchmark_date=(datetime.date.today()-datetime.timedelta(days=1)).isoformat(),
+                             horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价', benchmark_source='钢联', benchmark_unit='元/吨',
                              status='在途', created_at='now')
             flat = Viewpoint(user_id=self.user_id, user_name='张研究员', commodity='螺纹钢', direction='震荡',
-                             basis='多空交织', benchmark_price=4000, benchmark_date=today,
-                             horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价',
+                             basis='多空交织', benchmark_price=4000, benchmark_date=(datetime.date.today()-datetime.timedelta(days=1)).isoformat(),
+                             horizon_days=5, expire_date=today, benchmark_indicator='螺纹钢现货价', benchmark_source='钢联', benchmark_unit='元/吨',
                              status='在途', created_at='now')
             s.add_all([up, down, flat])
             s.commit()
@@ -119,6 +121,27 @@ class ViewpointTests(unittest.TestCase):
             self.assertTrue(viewpoint.settle(s, vp))
             self.assertEqual(vp.outcome, '无法结算')
             self.assertIn('价格数据', vp.note)
+
+    def test_locked_source_and_freshness(self):
+        import viewpoint
+        today = datetime.date.today().isoformat()
+        with SessionFactory() as s:
+            # 其他来源有更新价也不得回退。
+            self.assertIsNone(viewpoint.price_on(s, '螺纹钢', today, source='不存在来源', indicator='螺纹钢现货价'))
+            self.assertIsNone(viewpoint.price_on(s, '铁矿石', today))
+            self.assertIsNone(viewpoint.price_on(s, '螺纹钢', today, source='钢联', indicator='螺纹钢现货价', unit='美元/吨'))
+            vp = Viewpoint(commodity='螺纹钢', direction='看多', benchmark_price=3900,
+                           benchmark_date=today, expire_date=today, benchmark_source='钢联',
+                           benchmark_indicator='螺纹钢现货价', benchmark_unit='元/吨', status='在途')
+            self.assertTrue(viewpoint.settle(s, vp))
+            self.assertEqual(vp.outcome, '无法结算')
+            self.assertIn('未晚于', vp.note)
+            # 单独登记没有来源的旧观点，不能猜测。
+            vp = Viewpoint(commodity='螺纹钢', direction='看多', benchmark_price=3900,
+                           benchmark_date='2026-01-01', expire_date=today, status='在途')
+            viewpoint.settle(s, vp)
+            self.assertEqual(vp.outcome, '无法结算')
+            self.assertIn('缺少锁定', vp.note)
 
     def test_outcome_math(self):
         import viewpoint
@@ -205,7 +228,7 @@ class SummaryNormalizeTests(unittest.TestCase):
             self.assertTrue(cats, '分类迁移应产生末级分类')
             cid = cats[0]['id']
             kind = json.loads(s.get(db.Category, cid).config).get('kind', '')
-            author = db.Author(name='测试作者', types=json.dumps([kind]), enabled=1)
+            author = db.Author(name='摘要测试-' + uuid.uuid4().hex[:12], types=json.dumps([kind]), enabled=1)
             s.add(author)
             s.commit()
             aid = author.id

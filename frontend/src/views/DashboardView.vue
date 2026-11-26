@@ -28,7 +28,7 @@
       <ReportTable :reports="recent" @open="openReport" @more="moreVisible = true; moreId = $event" />
     </div>
 
-    <NewReportDialog v-model="dialogVisible" @created="openReport" />
+    <NewReportDialog v-model="dialogVisible" @created="createdReport" />
     <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" />
   </div>
 </template>
@@ -36,6 +36,7 @@
 <script setup>
 import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { createdReportRoute } from '../utils/reportCreation';
 import PageHead from '../components/PageHead.vue';
 import ReportTable from '../components/ReportTable.vue';
 import NewReportDialog from '../components/NewReportDialog.vue';
@@ -44,6 +45,7 @@ import { dataRows, reports, session, user } from '../store/session';
 import { sortReports } from '../utils/format';
 
 const router = useRouter();
+const createdReport = (id, options) => router.push(createdReportRoute(id, options));
 const dialogVisible = ref(false);
 const moreVisible = ref(false);
 const moreId = ref(null);

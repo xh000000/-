@@ -2,12 +2,29 @@
   <div class="agent-page">
     <PageHead
       title="AI 问答"
-      description="内置投研 Agent：查研报、取指标、读资料库，并把候选章节草稿写回平台；生成内容须人工核对后方可送审。"
+      description="围绕研报、指标和研究资料展开对话。需要成稿时，从左侧开始生成研报。"
     >
-      <span v-if="status?.configured" class="tiny">模型：{{ status.model }}</span>
-      <el-button :loading="pipelineLoading" @click="runPipeline">AI 日报</el-button>
+      <span v-if="status?.configured" class="tiny agent-model">模型：{{ status.model }}</span>
+      <el-button v-if="canGenerate" @click="jobsVisible = true">生成记录<span v-if="activeJobCount"> · {{ activeJobCount }} 进行中</span></el-button>
       <el-button :loading="threadsLoading" @click="loadThreads">刷新</el-button>
     </PageHead>
+
+    <el-drawer v-if="canGenerate" v-model="jobsVisible" title="研报生成记录" size="min(560px, 100vw)">
+    <section class="report-workbench">
+      <div class="report-workbench-head">
+        <div><b>最近生成任务</b><p class="caption">查看章节进度，返回研报核对并采用候选。</p></div>
+        <el-button :loading="jobsLoading" @click="loadReportJobs">刷新任务</el-button>
+      </div>
+      <p v-if="jobsError" role="alert">{{ jobsError }}</p>
+      <p v-else-if="!reportJobs.length" class="caption">还没有生成任务。点击「AI 生成研报」开始；已有草稿也可在编辑器中继续生成。</p>
+      <div v-for="job in reportJobs" :key="job.id" class="report-job">
+        <div><b>{{ job.title }}</b><span v-if="job.shared" class="caption"> · 协作任务 / {{ job.initiator }}</span><p class="caption">{{ (job.created_at || '').replace(/\.\d+(?= UTC$)/, '') }} · {{ job.result.stage || job.status }} · {{ job.result.completed || 0 }}/{{ job.result.total || 0 }} 章</p><p v-if="job.error" class="report-job-error">{{ job.error }}</p></div>
+        <el-tag>{{ ['已完成','部分采用'].includes(job.status) ? '候选待确认' : job.status }}</el-tag>
+        <el-button @click="openReportJob(job)">{{ ['已完成','部分采用'].includes(job.status) ? '查看候选' : '打开研报' }}</el-button>
+      </div>
+    </section>
+    </el-drawer>
+    <NewReportDialog v-model="reportDialog" ai-mode @created="createdReport" />
 
     <el-alert
       v-if="status && !status.configured"
@@ -20,7 +37,7 @@
       管理员请在项目根目录 .env 设置 AGENT_API_KEY 与 AGENT_MODEL（未设置的项会回落到「系统设置 → 外部模型」的平台配置），重启后端后即可使用。
     </el-alert>
 
-    <div v-else-if="status" class="agent-body">
+    <div v-if="status" class="agent-body">
       <div class="panel agent-threads">
         <div class="agent-threads-head">
           <b>对话线程</b>
@@ -46,6 +63,12 @@
           <p v-if="!threads.length && !threadsLoading" class="caption agent-threads-empty">
             还没有对话，点上方「＋ 新对话」开始
           </p>
+        </div>
+        <div v-if="canGenerate" class="agent-report-entry">
+          <span class="agent-entry-label">从研究到成稿</span>
+          <p>沿用分类模板和 Skill，生成有数据依据的研报候选。</p>
+          <el-button class="agent-report-button" @click="reportDialog = true"><el-icon><DocumentAdd /></el-icon><span>AI 生成研报</span><span aria-hidden="true">↗</span></el-button>
+          <button class="agent-report-link" type="button" @click="router.push('/reports')">前往研报中心 →</button>
         </div>
       </div>
 
@@ -102,7 +125,11 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { useRouter } from 'vue-router';
+import { createdReportRoute } from '../utils/reportCreation';
+import { DocumentAdd } from '@element-plus/icons-vue';
+import NewReportDialog from '../components/NewReportDialog.vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import PageHead from '../components/PageHead.vue';
 import { api, del } from '../api';
@@ -115,7 +142,7 @@ const TOOL_LABELS = {
   query_indicator: '查询指标数据',
   list_commodities: '查询品种库',
   search_library: '检索资料库',
-  save_chapter_draft: '写入章节草稿',
+  save_chapter_draft: '保存章节候选',
 };
 
 const suggestions = [
@@ -132,7 +159,32 @@ const threadId = ref('');
 const messages = ref([]);
 const input = ref('');
 const streaming = ref(false);
-const pipelineLoading = ref(false);
+const router = useRouter();
+const reportDialog = ref(false);
+const jobsVisible = ref(false);
+const activeJobCount = computed(() => reportJobs.value.filter(j => ['排队中','运行中'].includes(j.status)).length);
+const canGenerate = computed(() => ['admin', 'researcher'].includes(user.value.role));
+const reportJobs = ref([]);
+const jobsLoading = ref(false);
+const jobsError = ref('');
+let jobsTimer;
+let disposed = false;
+const createdReport = (id, options) => router.push(createdReportRoute(id, options));
+const openReportJob = job => router.push({name:'editor',params:{id:job.report_id},query:job.editable ? {ai:'1'} : {}});
+async function loadReportJobs() {
+  if (!canGenerate.value || jobsLoading.value || disposed) return;
+  jobsLoading.value = true;
+  try {
+    const result = await api('report-ai/recent-jobs');
+    if (!disposed) { reportJobs.value = result.jobs || []; jobsError.value = ''; }
+  } catch (error) {
+    if (!disposed) jobsError.value = error.message || '生成任务加载失败';
+  } finally {
+    jobsLoading.value = false;
+    clearTimeout(jobsTimer);
+    if (!disposed && reportJobs.value.some(j => ['排队中','运行中'].includes(j.status))) jobsTimer = setTimeout(loadReportJobs, 5000);
+  }
+}
 const scroller = ref(null);
 let controller = null;
 
@@ -322,51 +374,32 @@ function stop() {
   if (controller) controller.abort();
 }
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-/* AI 日报流水线：确认 → 排队 → 轮询任务直到完成/失败 */
-async function runPipeline() {
-  try {
-    await ElMessageBox.confirm(
-      '流水线将自动取数、逐板块生成初稿、创建报告并推进到「研究复核」（整篇标记 AI 初稿，须人工复核后才能发布）。继续？',
-      'AI 日报流水线', { confirmButtonText: '开始生成', cancelButtonText: '取消', type: 'info' },
-    );
-  } catch {
-    return;
-  }
-  pipelineLoading.value = true;
-  try {
-    const task = await api('agent/pipeline/run', {});
-    ElMessage.info('流水线任务已排队，后台生成中（通常需要几分钟）…');
-    for (let i = 0; i < 120; i++) {
-      await sleep(3000);
-      const t = await api(`agent/tasks/${task.id}`);
-      if (t.status === '已完成') {
-        let summary = {};
-        try { summary = JSON.parse(t.result || '{}'); } catch { /* 结果非 JSON 时忽略 */ }
-        const okCount = (summary.sections || []).filter(s => s.ok).length;
-        ElMessageBox.alert(
-          `《${summary.title || '日度策略'}》初稿已生成${summary.submitted ? '，并已进入研究复核' : '（未能自动送审，请在报告中手动提交）'}。`
-          + `成功撰写 ${okCount}/${(summary.sections || []).length} 个章节。请在研报中心查看并复核。`,
-          '流水线完成', { confirmButtonText: '知道了' },
-        );
-        return;
-      }
-      if (t.status === '失败') {
-        ElMessage.error(t.error || '流水线执行失败');
-        return;
-      }
-    }
-    ElMessage.warning('任务仍在后台运行，可稍后在任务列表查看结果');
-  } catch (error) {
-    ElMessage.error(error.message || '触发流水线失败');
-  } finally {
-    pipelineLoading.value = false;
-  }
-}
-
 onMounted(() => {
+  loadReportJobs();
   loadStatus();
   loadThreads();
 });
+onUnmounted(() => { disposed = true; clearTimeout(jobsTimer); stop(); });
 </script>
+
+<style scoped>
+.agent-model { padding:6px 10px; border-radius:20px; background:var(--el-fill-color-light); }
+.agent-report-entry { padding:18px 14px; border-top:1px solid var(--el-border-color-lighter); background:var(--el-fill-color-extra-light); }
+.agent-entry-label { font-size:12px; font-weight:600; color:var(--el-text-color-secondary); }
+.agent-report-entry p { font-size:12px; line-height:1.7; color:var(--el-text-color-secondary); margin:8px 0 14px; }
+.agent-report-button { width:100%; justify-content:flex-start; height:40px; border-color:var(--el-color-primary-light-7); color:var(--el-color-primary); }
+.agent-report-button :deep(>span) { display:flex; align-items:center; width:100%; gap:8px; }
+.agent-report-button :deep(>span>span:last-child) { margin-left:auto; }
+.agent-report-link { margin-top:12px; padding:0; background:none; border:0; color:var(--el-text-color-secondary); font:inherit; font-size:12px; cursor:pointer; }
+.agent-report-link:hover { color:var(--el-color-primary); }
+.report-workbench-head,.report-job { display:flex; align-items:center; gap:12px; }
+.report-workbench-head>div,.report-job>div { flex:1; min-width:0; }
+.report-workbench p { margin:8px 0; line-height:1.6; }
+.report-job { padding:18px 0; border-bottom:1px solid var(--el-border-color-lighter); flex-wrap:wrap; }
+.report-job>div { flex-basis:100%; }
+.report-job-error { color:var(--el-color-danger); overflow-wrap:anywhere; }
+.agent-welcome h3 { font-size:26px; font-weight:600; letter-spacing:-.5px; }
+.agent-welcome { max-width:560px; }
+.agent-suggest { margin-top:24px; }
+@media(max-width:760px) { .agent-threads { max-height:300px; } .agent-report-entry { padding:12px; } .agent-report-entry p { display:none; } .agent-report-button { margin-top:8px; } }
+</style>

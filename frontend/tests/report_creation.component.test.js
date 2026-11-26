@@ -47,7 +47,7 @@ describe('添加研报组件交互',()=>{
  it.each(['flow','grid','free'])('布局 %s 正确提交并跳转',async(layout)=>{
   await radio(layout);await input('报告标题','自定义研报标题');await input('报告摘要','摘要内容');await click('确定并进入编辑器');
   expect(api).toHaveBeenCalledWith('reports',expect.objectContaining({manual:true,title:'自定义研报标题',summary:'摘要内容',byline_id:10,commodity:'铜',layout,collaboration:'personal',public:true,inherit_id:null}));
-  expect(wrapper.emitted('created')?.[0]).toEqual([99]);expect(store.refresh).toHaveBeenCalled();
+  expect(wrapper.emitted('created')?.[0]).toEqual([99,{writingMode:'manual',collaboration:'personal'}]);expect(store.refresh).toHaveBeenCalled();
  });
  it('空标题和日期均阻止提交',async()=>{
   await input('报告标题','');await click('确定并进入编辑器');expect(api).not.toHaveBeenCalled();
@@ -100,6 +100,32 @@ describe('添加研报组件交互',()=>{
  it('后台失败保留窗口与草稿，允许重试',async()=>{
   api.mockRejectedValueOnce(new Error('测试网络错误'));await input('报告标题','保留草稿');await click('确定并进入编辑器');
   expect(wrapper.emitted('created')).toBeUndefined();expect(row('报告标题').find('input').element.value).toBe('保留草稿');
-  await click('确定并进入编辑器');expect(api).toHaveBeenCalledTimes(2);expect(wrapper.emitted('created')?.[0]).toEqual([99]);
+  await click('确定并进入编辑器');expect(api).toHaveBeenCalledTimes(2);expect(wrapper.emitted('created')?.[0]).toEqual([99,{writingMode:'manual',collaboration:'personal'}]);
  });
+});
+
+it('AI 辅助多人模式说明先分工，并将所选写作方式交给入口跳转',async()=>{
+ await radio('ai');await radio('shared');await select('协作人','协作研究员');
+ expect(row('写作方式').text()).toContain('分配章节负责人');
+ await click('确定并进入编辑器');
+ expect(wrapper.emitted('created')[0]).toEqual([99,{writingMode:'ai',collaboration:'shared',assignmentsReady:true}]);
+});
+it('AI 快捷入口默认 AI 辅助，仍可切回手工编写',async()=>{
+ await wrapper.setProps({modelValue:false,aiMode:true});await ready();await wrapper.setProps({modelValue:true});await ready();
+ expect(row('写作方式').find('input[value="ai"]').element.checked).toBe(true);
+ await radio('manual');await click('确定并进入编辑器');expect(wrapper.emitted('created')[0][1].writingMode).toBe('manual');
+});
+it('新建弹窗按组展示章节，并将统一分工与研报一起提交',async()=>{
+ await radio('shared');await select('协作人','协作研究员');
+ expect(dom().find('.creation-outline').text()).toContain('市场展望');
+ await dom().find('.creation-batch .el-select').trigger('click');await ready();
+ [...document.querySelectorAll('.el-select-dropdown__item')].find(x=>x.textContent==='协作研究员').click();await ready();
+ await click('应用全部章节');await click('确定并进入编辑器');
+ expect(api).toHaveBeenCalledWith('reports',expect.objectContaining({section_assignments:[{section_id:'one',editors:[2]}]}));
+});
+it('切换分类会重置章节分工，避免复用另一个模板的分配',async()=>{
+ await radio('shared');await select('协作人','协作研究员');await dom().find('.creation-batch .el-select').trigger('click');await ready();
+ [...document.querySelectorAll('.el-select-dropdown__item')].find(x=>x.textContent==='协作研究员').click();await ready();await click('应用全部章节');
+ await select('报告分类','周报');await click('确定并进入编辑器');
+ expect(api).toHaveBeenCalledWith('reports',expect.objectContaining({section_assignments:[{section_id:'one',editors:[1]}]}));
 });

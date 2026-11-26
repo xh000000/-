@@ -76,3 +76,23 @@ describe('多个模型配置与启用',()=>{
   expect(field('配置名称').find('input').element.value).toBe('未保存草稿');
  });
 });
+
+describe('外部模型管理体验',()=>{
+ it('按名称或模型搜索配置',async()=>{
+  await mountView();await wrapper.find('input[aria-label="搜索模型配置"]').setValue('model-b');await ready();
+  expect(row('深度分析')).toBeTruthy();expect(row('日常写作')).toBeUndefined();
+ });
+ it('复制配置保留接口和模型，要求重新填密钥',async()=>{
+  await mountView();await button(row('日常写作'),'复制').trigger('click');await ready();
+  expect(field('配置名称').find('input').element.value).toBe('日常写作 副本');
+  expect(field('接口地址').find('input').element.value).toBe('https://a.example/v1');
+  expect(field('API Key').find('input').element.value).toBe('');
+  await button(body(),'保存配置').trigger('click');await ready();
+  expect(api.mock.calls.filter(([path])=>path==='ai/profiles')).toHaveLength(0);
+ });
+ it('测试失败在对应行显示余额处理提示',async()=>{
+  await mountView();api.mockRejectedValueOnce(new Error('429 credit_balance_exhausted'));
+  await button(row('深度分析'),'测试').trigger('click');await ready();
+  expect(row('深度分析').text()).toContain('API 余额或额度不足');expect(row('日常写作').text()).toContain('未测试');
+ });
+});

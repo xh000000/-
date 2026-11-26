@@ -11,7 +11,7 @@ export const MENU = [
   {
     label: '研报管理', icon: Document, children: [
       { label: '研报中心', path: '/reports' },
-      { label: '观点库', path: '/viewpoints' },
+      { label: '研报观点跟踪', path: '/viewpoints' },
       { label: '分类列表', path: '/config/categories', admin: true },
       { label: '作者管理', path: '/config/authors', admin: true },
       { label: '云盘', path: '/library/cloud' },
@@ -64,6 +64,7 @@ export const MENU = [
   {
     label: '工具箱', icon: Tools, children: [
       { label: 'AI问答', path: '/agent' },
+      { label: 'Skill 管理', path: '/system/skills' },
       { label: '商品价格曲线' }, { label: '持仓分析' }, { label: '联储观察' },
       { label: '预警管理' },
     ],

@@ -1,3 +1,5 @@
+from test_environment import prepare
+prepare()
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory

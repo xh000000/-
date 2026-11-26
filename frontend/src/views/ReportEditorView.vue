@@ -10,6 +10,8 @@
       </div>
       <div class="actions">
         <el-button @click="openInfo">基础信息</el-button>
+        <el-button v-if="shared && creator && editable" @click="openAssignments">章节分工</el-button>
+        <el-button v-if="canUseSkills && editable && report.document" type="primary" plain @click="openSkillGenerator">AI / Skill 生成</el-button>
         <el-button v-if="report.document" @click="openPreview">预览</el-button>
         <el-button @click="openPrint">打印 / PDF</el-button>
         <el-button v-if="report.can_schedule" @click="openSchedule">定时发布</el-button>
@@ -22,6 +24,12 @@
           {{ actionLabel(action) }}
         </el-button>
       </div>
+    </div>
+
+    <div v-if="aiSetup && shared && creator && editable" class="panel" style="margin:12px 0;padding:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="flex:1;min-width:240px"><b>先分配章节，再开始 AI 写作</b><p class="caption" style="margin:6px 0 0">在集中分工窗口批量分配各章负责人，也可单章调整。AI 可统一生成整篇候选，各章负责人分别核对采用。</p></div>
+      <el-button @click="openAssignments">设置章节分工</el-button>
+      <el-button type="primary" @click="beginSharedAI">完成分工，开始 AI 生成</el-button>
     </div>
 
     <!-- 旧版纯文本报告 -->
@@ -114,7 +122,7 @@
             <el-button size="small" @mousedown.prevent="exec('italic')"><i>I</i></el-button>
             <el-button size="small" @mousedown.prevent="exec('underline')"><u>U</u></el-button>
             <el-button size="small" @mousedown.prevent="exec('insertUnorderedList')">•</el-button>
-            <el-button size="small" :loading="generating" @click="generate">AI 生成本章候选</el-button>
+            <el-button size="small" @click="openSkillGenerator(section.id)">AI 生成本章候选</el-button>
           </template>
           <span v-else class="caption">本章节不可编辑（已提交或未分配给你）</span>
           <span class="grow"></span>
@@ -230,6 +238,9 @@
         <el-button v-if="infoEditable" type="primary" :loading="busy" @click="saveInfo">保存</el-button>
       </template>
     </el-dialog>
+
+    <ChapterAssignments v-model="assignmentsVisible" :report="report" @saved="skillGeneratedSaved" />
+    <AiReportGenerator v-model="skillGeneratorVisible" :report="report" :focus-section-id="skillFocusSection" @saved="skillGeneratedSaved" />
 
     <!-- 章节设置 -->
     <el-dialog v-model="chapterVisible" title="章节设置" width="620px">
@@ -418,11 +429,33 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { Document, Grid, Loading, Picture, Setting, TrendCharts } from '@element-plus/icons-vue';
 import ReportBlock from '../components/ReportBlock.vue';
 import StatusTag from '../components/StatusTag.vue';
+import AiReportGenerator from '../components/AiReportGenerator.vue';
+import ChapterAssignments from '../components/ChapterAssignments.vue';
 import { api, fileUrl, printUrl } from '../api';
 import {
   authors, commodities, library, memberName, indicators, refresh, reportById, user,
 } from '../store/session';
 import { localTime, escapeHtml, makeId, parseJSON, statusText, today, MODE_NAMES } from '../utils/format';
+
+const assignmentsVisible = ref(false);
+function openAssignments(){
+  if(dirty.value)return ElMessage.warning('请先保存当前修改，再调整章节分工');
+  assignmentsVisible.value = true;
+}
+const skillGeneratorVisible = ref(false);
+const aiSetup = ref(false);
+function beginSharedAI() {
+  if (dirty.value) return ElMessage.warning('请先保存当前修改，再开始 AI 生成');
+  openSkillGenerator(); aiSetup.value = false;
+  router.replace({path:route.path,query:{...route.query,ai:undefined}});
+}
+const skillFocusSection = ref('');
+function openSkillGenerator(sectionId) {
+  if (dirty.value) return ElMessage.warning('请先保存当前修改，再生成 Skill 候选');
+  skillFocusSection.value = typeof sectionId === 'string' ? sectionId : '';
+  skillGeneratorVisible.value = true;
+}
+async function skillGeneratedSaved() { await refresh(); initDraft(true); }
 
 const route = useRoute();
 const router = useRouter();
@@ -432,6 +465,7 @@ const meta = computed(() => parseJSON(report.value?.metadata, null));
 const paperCfg = computed(() => parseJSON(report.value?.config_snapshot, {}) || {});
 const shared = computed(() => meta.value?.collaboration === 'shared');
 const creator = computed(() => report.value?.author === user.value.id);
+const canUseSkills = computed(() => ['admin','researcher'].includes(user.value.role) && (creator.value || (meta.value?.collaborators || []).includes(user.value.id)));
 const editable = computed(
   () => Boolean(report.value) && ['草稿', '已退回'].includes(report.value.status) &&
     (shared.value ? true : report.value.author === user.value.id)
@@ -442,7 +476,6 @@ const draft = ref(null);
 const title = ref('');
 const chapterIndex = ref(0);
 const busy = ref(false);
-const generating = ref(false);
 const dirty = ref(false);
 const legacy = reactive({ title: '', body: '' });
 let draftId = null;
@@ -607,7 +640,15 @@ function beforeUnload(event) {
   event.preventDefault();
   event.returnValue = '';
 }
-onMounted(() => window.addEventListener('beforeunload', beforeUnload));
+onMounted(() => {
+  window.addEventListener('beforeunload', beforeUnload);
+  if (route.query?.ai === 'setup' && shared.value && creator.value && editable.value) {
+    aiSetup.value = true;
+  } else if (route.query?.ai === '1' && canUseSkills.value && editable.value) {
+    openSkillGenerator();
+    router.replace({path:route.path,query:{...route.query,ai:undefined}});
+  }
+});
 onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload));
 
 async function goBack() {
@@ -802,39 +843,6 @@ function pickImage(item) {
 
 function exec(command) {
   document.execCommand(command, false, null);
-}
-
-async function generate() {
-  const current = section.value;
-  if (!current) return;
-  const hasText = (current.blocks || []).some(item => item.type === 'text' && String(item.text || '').trim());
-  if (hasText) {
-    try {
-      await ElMessageBox.confirm('本章已有正文，生成结果会覆盖现有文字（其他组件不受影响）。', '覆盖当前章节？', {
-        confirmButtonText: '覆盖', cancelButtonText: '取消', type: 'warning',
-      });
-    } catch {
-      return;
-    }
-  }
-  generating.value = true;
-  try {
-    const result = await api('generate', { id: report.value.id, section_id: current.id });
-    // 新报告的章节是空的、一个块也没有，生成完得先有个文字块落内容
-    let block = current.blocks.find(item => item.type === 'text');
-    if (!block) {
-      block = { id: makeId(), type: 'text', span: 12, title: '', text: '', html: '' };
-      appendBlock(block, current);
-    }
-    block.text = result.body;
-    block.html = String(result.body || '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])).replaceAll('\n', '<br>');
-    const seconds = result.elapsed_ms ? (result.elapsed_ms / 1000).toFixed(1) + ' 秒' : '';
-    ElMessage.success('候选内容已生成' + (seconds ? '（' + seconds + '）' : '') + '，核验后请点「保存本章」');
-  } catch (error) {
-    ElMessage.error(error.message || '生成失败');
-  } finally {
-    generating.value = false;
-  }
 }
 
 /* ---------- 弹窗：基础信息 ---------- */

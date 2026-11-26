@@ -13,19 +13,82 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import socket
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
-    Float, Integer, LargeBinary, Text, UniqueConstraint, create_engine, event, inspect, select, text,
+    Float, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, event, inspect,
+    select, text,
 )
+from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+
+def big_text() -> Text:
+    """长文本列的类型：MySQL 用 LONGTEXT，其余方言保持 TEXT。
+
+    MySQL 的 TEXT 只有 64KB，而研报正文加章节 JSON 一份就可能越线（实测 document
+    约 20KB，正文再叠加）。SQLite 与 PostgreSQL 的 TEXT 本身无长度上限，保持原样。
+
+    必须用 ``with_variant``：直接继承 Text 子类不行——DDL 编译按 ``__visit_name__``
+    派发，子类继承到的仍是 "text"，编译出来永远是 TEXT，换个写法才真正生效。
+    """
+    return Text().with_variant(LONGTEXT(), 'mysql')
+
+
+def big_blob() -> LargeBinary:
+    """附件列的类型：MySQL 用 LONGBLOB，其余方言保持原样（BLOB 只有 64KB）。"""
+    return LargeBinary().with_variant(LONGBLOB(), 'mysql')
+
 
 ROOT = Path(__file__).parent
 DB_PATH = Path(os.getenv('DATA_DIR', str(ROOT / 'data'))) / 'research.db'
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 DB_URL = os.getenv('DATABASE_URL') or ('sqlite:///' + DB_PATH.as_posix())
+
+
+def _normalize_url(url: str) -> str:
+    """把裸连接串补成本项目实际安装的驱动。
+
+    - ``postgresql://`` → ``postgresql+psycopg://``：不补会去找 psycopg2，而依赖里装的是
+      psycopg3，部署时就会变成"连不上库"这种和驱动缺包混在一起报的错。
+    - ``mysql://`` → ``mysql+pymysql://``：云厂商文档给的都是裸 mysql://，SQLAlchemy 默认
+      会去找 MySQLdb（需要编译 C 扩展），沙箱里装不上。
+    """
+    for prefix in ('postgresql://', 'postgres://'):
+        if url.startswith(prefix):
+            return 'postgresql+psycopg://' + url[len(prefix):]
+    if url.startswith('mysql://'):
+        return 'mysql+pymysql://' + url[len('mysql://'):]
+    return url
+
+
+DB_URL = _normalize_url(DB_URL)
+
+
+def _sanitize_pg_url(url: str) -> str:
+    """去掉会让 libpq 在跨境链路上卡死的参数。
+
+    ``channel_binding=require`` 要求 SCRAM 走 tls-server-end-point 通道绑定。云厂商
+    的连接池（Neon pooler 之类）在中间终止 TLS，这个协商经常谈不拢，表现不是报错
+    而是**一直等到超时**。实测同一个库：带 channel_binding 必挂，去掉后能连上。
+
+    注意不要改成往 hostaddr 里固定单个 IP：域名背后有多台机器，其中一部分 TCP 能
+    握手、但会话在认证阶段被丢，写死就是干等着超时；交给 libpq 轮询全部地址反而
+    能落到一台好的上面。
+    """
+    if not url.startswith('postgresql'):
+        return url
+    return re.sub(r'[?&]channel_binding=[^&]*', '', url)
+
+
+DB_URL = _sanitize_pg_url(DB_URL)
 
 
 class Base(DeclarativeBase):
@@ -75,22 +138,22 @@ class MappingMixin:
 class User(Base, MappingMixin):
     __tablename__ = 'users'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, unique=True)
-    role: Mapped[str | None] = mapped_column(Text)
-    salt: Mapped[str | None] = mapped_column(Text)
-    hash: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(String(191), unique=True)
+    role: Mapped[str | None] = mapped_column(big_text())
+    salt: Mapped[str | None] = mapped_column(big_text())
+    hash: Mapped[str | None] = mapped_column(big_text())
     dept_id: Mapped[int | None] = mapped_column(Integer)
-    phone: Mapped[str | None] = mapped_column(Text, default='')
-    title: Mapped[str | None] = mapped_column(Text, default='')
+    phone: Mapped[str | None] = mapped_column(big_text(), default='')
+    title: Mapped[str | None] = mapped_column(big_text(), default='')
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
     role_id: Mapped[int | None] = mapped_column(Integer)
-    created_at: Mapped[str | None] = mapped_column(Text, default='')
-    last_login_at: Mapped[str | None] = mapped_column(Text, default='')
+    created_at: Mapped[str | None] = mapped_column(big_text(), default='')
+    last_login_at: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class SessionRow(Base, MappingMixin):
     __tablename__ = 'sessions'
-    token: Mapped[str] = mapped_column(Text, primary_key=True)
+    token: Mapped[str] = mapped_column(big_text(), primary_key=True)
     user_id: Mapped[int | None] = mapped_column(Integer)
     expires: Mapped[float | None] = mapped_column(Float)
     remember: Mapped[int | None] = mapped_column(Integer, default=0)
@@ -100,29 +163,29 @@ class SessionRow(Base, MappingMixin):
 class Report(Base, MappingMixin):
     __tablename__ = 'reports'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    title: Mapped[str | None] = mapped_column(Text)
-    commodity: Mapped[str | None] = mapped_column(Text)
-    kind: Mapped[str | None] = mapped_column(Text)
-    body: Mapped[str | None] = mapped_column(Text)
-    status: Mapped[str | None] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(big_text())
+    commodity: Mapped[str | None] = mapped_column(big_text())
+    kind: Mapped[str | None] = mapped_column(big_text())
+    body: Mapped[str | None] = mapped_column(big_text())
+    status: Mapped[str | None] = mapped_column(big_text())
     author: Mapped[int | None] = mapped_column(Integer)
     version: Mapped[int | None] = mapped_column(Integer, default=1)
-    updated: Mapped[str | None] = mapped_column(Text)
-    document: Mapped[str | None] = mapped_column(Text, default='')
-    config_snapshot: Mapped[str | None] = mapped_column(Text, default='')
+    updated: Mapped[str | None] = mapped_column(big_text())
+    document: Mapped[str | None] = mapped_column(big_text(), default='')
+    config_snapshot: Mapped[str | None] = mapped_column(big_text(), default='')
     category_id: Mapped[int | None] = mapped_column(Integer)
-    workflow_state: Mapped[str | None] = mapped_column(Text, default='')
+    workflow_state: Mapped[str | None] = mapped_column(big_text(), default='')
     inherited_from: Mapped[int | None] = mapped_column(Integer)
-    metadata_: Mapped[str | None] = mapped_column('metadata', Text, default='')
-    updated_by: Mapped[str | None] = mapped_column(Text, default='')
-    published_at: Mapped[str | None] = mapped_column(Text, default='')
-    approved_at: Mapped[str | None] = mapped_column(Text, default='')
+    metadata_: Mapped[str | None] = mapped_column('metadata', big_text(), default='')
+    updated_by: Mapped[str | None] = mapped_column(big_text(), default='')
+    published_at: Mapped[str | None] = mapped_column(big_text(), default='')
+    approved_at: Mapped[str | None] = mapped_column(big_text(), default='')
     views: Mapped[int | None] = mapped_column(Integer, default=0)
     issue: Mapped[int | None] = mapped_column(Integer, default=0)
     deleted: Mapped[int | None] = mapped_column(Integer, default=0)
-    scheduled_at: Mapped[str | None] = mapped_column(Text, default='')
+    scheduled_at: Mapped[str | None] = mapped_column(big_text(), default='')
     ai_draft: Mapped[int | None] = mapped_column(Integer, default=0)  # 1=含 AI 生成内容，须人工复核
-    ai_summary: Mapped[str | None] = mapped_column(Text, default='')  # AI 摘要卡 JSON：核心观点/逻辑链/数据要点
+    ai_summary: Mapped[str | None] = mapped_column(big_text(), default='')  # AI 摘要卡 JSON：核心观点/逻辑链/数据要点
 
 
 class Version(Base, MappingMixin):
@@ -130,24 +193,24 @@ class Version(Base, MappingMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     report_id: Mapped[int | None] = mapped_column(Integer)
     version: Mapped[int | None] = mapped_column(Integer)
-    body: Mapped[str | None] = mapped_column(Text)
-    title: Mapped[str | None] = mapped_column(Text)
-    actor: Mapped[str | None] = mapped_column(Text)
-    at: Mapped[str | None] = mapped_column(Text)
-    document: Mapped[str | None] = mapped_column(Text, default='')
-    config_snapshot: Mapped[str | None] = mapped_column(Text, default='')
-    metadata_: Mapped[str | None] = mapped_column('metadata', Text, default='')
+    body: Mapped[str | None] = mapped_column(big_text())
+    title: Mapped[str | None] = mapped_column(big_text())
+    actor: Mapped[str | None] = mapped_column(big_text())
+    at: Mapped[str | None] = mapped_column(big_text())
+    document: Mapped[str | None] = mapped_column(big_text(), default='')
+    config_snapshot: Mapped[str | None] = mapped_column(big_text(), default='')
+    metadata_: Mapped[str | None] = mapped_column('metadata', big_text(), default='')
 
 
 class Event(Base, MappingMixin):
     __tablename__ = 'events'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     report_id: Mapped[int | None] = mapped_column(Integer)
-    actor: Mapped[str | None] = mapped_column(Text)
-    action: Mapped[str | None] = mapped_column(Text)
-    note: Mapped[str | None] = mapped_column(Text)
+    actor: Mapped[str | None] = mapped_column(big_text())
+    action: Mapped[str | None] = mapped_column(big_text())
+    note: Mapped[str | None] = mapped_column(big_text())
     version: Mapped[int | None] = mapped_column(Integer)
-    at: Mapped[str | None] = mapped_column(Text)
+    at: Mapped[str | None] = mapped_column(big_text())
 
 
 class Observation(Base, MappingMixin):
@@ -159,12 +222,14 @@ class Observation(Base, MappingMixin):
     __tablename__ = 'observations'
     __table_args__ = (UniqueConstraint('source', 'indicator', 'date', name='uq_observation_point'),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    source: Mapped[str | None] = mapped_column(Text)
-    indicator: Mapped[str | None] = mapped_column(Text)
-    date: Mapped[str | None] = mapped_column(Text)
+    # 这三列组成了唯一键，必须是定长字符串：MySQL 不允许对 TEXT 建索引（除非给前缀
+    # 长度），而且 191×4 字节刚好压在 InnoDB 单列索引上限以内，utf8mb4 下最稳。
+    source: Mapped[str | None] = mapped_column(String(64))
+    indicator: Mapped[str | None] = mapped_column(String(191))
+    date: Mapped[str | None] = mapped_column(String(32))
     value: Mapped[float | None] = mapped_column(Float)
-    unit: Mapped[str | None] = mapped_column(Text)
-    uploaded_by: Mapped[str | None] = mapped_column(Text)
+    unit: Mapped[str | None] = mapped_column(big_text())
+    uploaded_by: Mapped[str | None] = mapped_column(big_text())
     indicator_id: Mapped[int | None] = mapped_column(Integer, index=True)  # → dim_indicators.id
 
 
@@ -173,22 +238,22 @@ class PublicationHistory(Base, MappingMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     report_id: Mapped[int | None] = mapped_column(Integer)
     version: Mapped[int | None] = mapped_column(Integer)
-    document: Mapped[str | None] = mapped_column(Text)
-    config: Mapped[str | None] = mapped_column(Text)
-    metadata_: Mapped[str | None] = mapped_column('metadata', Text)
-    body: Mapped[str | None] = mapped_column(Text)
-    published_at: Mapped[str | None] = mapped_column(Text)
+    document: Mapped[str | None] = mapped_column(big_text())
+    config: Mapped[str | None] = mapped_column(big_text())
+    metadata_: Mapped[str | None] = mapped_column('metadata', big_text())
+    body: Mapped[str | None] = mapped_column(big_text())
+    published_at: Mapped[str | None] = mapped_column(big_text())
 
 
 class Category(Base, MappingMixin):
     __tablename__ = 'categories'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, unique=True)
-    config: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(String(191), unique=True)
+    config: Mapped[str | None] = mapped_column(big_text())
     revision: Mapped[int | None] = mapped_column(Integer, default=1)
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
     parent_id: Mapped[int | None] = mapped_column(Integer)
-    label: Mapped[str | None] = mapped_column(Text, default='')
+    label: Mapped[str | None] = mapped_column(big_text(), default='')
     sort_order: Mapped[int | None] = mapped_column(Integer, default=0)
     folder: Mapped[int | None] = mapped_column(Integer, default=0)
 
@@ -196,7 +261,7 @@ class Category(Base, MappingMixin):
 class CategoryMigration(Base, MappingMixin):
     __tablename__ = 'category_migration'
     category_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    original_name: Mapped[str | None] = mapped_column(Text)
+    original_name: Mapped[str | None] = mapped_column(big_text())
     parent_id: Mapped[int | None] = mapped_column(Integer)
 
 
@@ -208,39 +273,39 @@ class Commodity(Base, MappingMixin):
     """
     __tablename__ = 'commodities'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, unique=True)
+    name: Mapped[str] = mapped_column(String(191), unique=True)
     parent_id: Mapped[int | None] = mapped_column(Integer)
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
-    code: Mapped[str | None] = mapped_column(Text, default='')
-    exchange: Mapped[str | None] = mapped_column(Text, default='')
-    aliases: Mapped[str | None] = mapped_column(Text, default='')
+    code: Mapped[str | None] = mapped_column(big_text(), default='')
+    exchange: Mapped[str | None] = mapped_column(big_text(), default='')
+    aliases: Mapped[str | None] = mapped_column(big_text(), default='')
     position: Mapped[int | None] = mapped_column(Integer, default=0)
 
 
 class Author(Base, MappingMixin):
     __tablename__ = 'authors'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, unique=True)
-    types: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(String(191), unique=True)
+    types: Mapped[str | None] = mapped_column(big_text())
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
-    license: Mapped[str | None] = mapped_column(Text, default='')
+    license: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class ApprovalFlow(Base, MappingMixin):
     __tablename__ = 'approval_flows'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str | None] = mapped_column(Text)
-    category_ids: Mapped[str | None] = mapped_column(Text, default='[]')
-    nodes: Mapped[str | None] = mapped_column(Text, default='[]')
+    name: Mapped[str | None] = mapped_column(big_text())
+    category_ids: Mapped[str | None] = mapped_column(big_text(), default='[]')
+    nodes: Mapped[str | None] = mapped_column(big_text(), default='[]')
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
 
 
 class Role(Base, MappingMixin):
     __tablename__ = 'roles'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(Text, unique=True)
-    base_role: Mapped[str | None] = mapped_column(Text)
-    menus: Mapped[str | None] = mapped_column(Text, default='[]')
+    name: Mapped[str] = mapped_column(String(191), unique=True)
+    base_role: Mapped[str | None] = mapped_column(big_text())
+    menus: Mapped[str | None] = mapped_column(big_text(), default='[]')
     builtin: Mapped[int | None] = mapped_column(Integer, default=0)
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
 
@@ -248,7 +313,7 @@ class Role(Base, MappingMixin):
 class Department(Base, MappingMixin):
     __tablename__ = 'departments'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(big_text())
     parent_id: Mapped[int | None] = mapped_column(Integer)
     sort_order: Mapped[int | None] = mapped_column(Integer, default=0)
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
@@ -258,30 +323,30 @@ class ConfigEvent(Base, MappingMixin):
     __tablename__ = 'config_events'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     category_id: Mapped[int | None] = mapped_column(Integer)
-    actor: Mapped[str | None] = mapped_column(Text)
-    config: Mapped[str | None] = mapped_column(Text)
+    actor: Mapped[str | None] = mapped_column(big_text())
+    config: Mapped[str | None] = mapped_column(big_text())
     revision: Mapped[int | None] = mapped_column(Integer)
-    at: Mapped[str | None] = mapped_column(Text)
+    at: Mapped[str | None] = mapped_column(big_text())
 
 
 class LibraryItem(Base, MappingMixin):
     __tablename__ = 'library_items'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    area: Mapped[str | None] = mapped_column(Text)
-    kind: Mapped[str | None] = mapped_column(Text)
-    name: Mapped[str | None] = mapped_column(Text)
+    area: Mapped[str | None] = mapped_column(big_text())
+    kind: Mapped[str | None] = mapped_column(big_text())
+    name: Mapped[str | None] = mapped_column(big_text())
     parent_id: Mapped[int | None] = mapped_column(Integer)
     owner: Mapped[int | None] = mapped_column(Integer)
-    body: Mapped[str | None] = mapped_column(Text, default='')
-    blob: Mapped[bytes | None] = mapped_column(LargeBinary)
-    mime: Mapped[str | None] = mapped_column(Text, default='')
-    updated: Mapped[str | None] = mapped_column(Text)
+    body: Mapped[str | None] = mapped_column(big_text(), default='')
+    blob: Mapped[bytes | None] = mapped_column(big_blob())
+    mime: Mapped[str | None] = mapped_column(big_text(), default='')
+    updated: Mapped[str | None] = mapped_column(big_text())
     deleted: Mapped[int | None] = mapped_column(Integer, default=0)
 
 
 class SchemaFlag(Base, MappingMixin):
     __tablename__ = 'schema_flags'
-    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    name: Mapped[str] = mapped_column(String(191), primary_key=True)
 
 
 class AppSetting(Base, MappingMixin):
@@ -290,9 +355,9 @@ class AppSetting(Base, MappingMixin):
     环境变量是默认值，这里存的优先；这样换模型不必改 .env、也不必重启服务。
     """
     __tablename__ = 'app_settings'
-    key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[str] = mapped_column(Text, default='')
-    updated: Mapped[str | None] = mapped_column(Text, default='')
+    key: Mapped[str] = mapped_column(String(191), primary_key=True)
+    value: Mapped[str] = mapped_column(big_text(), default='')
+    updated: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class DataSource(Base, MappingMixin):
@@ -303,15 +368,15 @@ class DataSource(Base, MappingMixin):
     """
     __tablename__ = 'data_sources'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    key: Mapped[str] = mapped_column(Text, unique=True)       # ifind / wind / 自定义 key
-    name: Mapped[str] = mapped_column(Text)                   # 入库标签（observations.source）
-    product: Mapped[str | None] = mapped_column(Text, default='')     # iFinD / 金融终端
-    channel: Mapped[str | None] = mapped_column(Text, default='')     # 取数通道说明
-    scope_mode: Mapped[str | None] = mapped_column(Text, default='commodity')  # commodity / custom
-    scope_items: Mapped[str | None] = mapped_column(Text, default='[]')        # custom 时的可选项
+    key: Mapped[str] = mapped_column(String(64), unique=True)  # ifind / wind / 自定义 key
+    name: Mapped[str] = mapped_column(big_text())                   # 入库标签（observations.source）
+    product: Mapped[str | None] = mapped_column(big_text(), default='')     # iFinD / 金融终端
+    channel: Mapped[str | None] = mapped_column(big_text(), default='')     # 取数通道说明
+    scope_mode: Mapped[str | None] = mapped_column(big_text(), default='commodity')  # commodity / custom
+    scope_items: Mapped[str | None] = mapped_column(big_text(), default='[]')        # custom 时的可选项
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
     builtin: Mapped[int | None] = mapped_column(Integer, default=0)
-    created_at: Mapped[str | None] = mapped_column(Text, default='')
+    created_at: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class DataSourceConfig(Base, MappingMixin):
@@ -323,24 +388,24 @@ class DataSourceConfig(Base, MappingMixin):
     """
     __tablename__ = 'data_source_configs'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str | None] = mapped_column(Text)            # 配置名，如「同花顺-黑色日盘」
-    source: Mapped[str | None] = mapped_column(Text)          # ifind / wind，决定入库标签
-    kind: Mapped[str | None] = mapped_column(Text)            # ifind_http / generic_json
-    base_url: Mapped[str | None] = mapped_column(Text)
-    account: Mapped[str | None] = mapped_column(Text)         # 账号 / AppID / 用户名
-    secret: Mapped[str | None] = mapped_column(Text)          # 密码 / refresh_token / apikey
-    scope: Mapped[str | None] = mapped_column(Text)           # JSON：items、metrics、days、code_suffix
-    options: Mapped[str | None] = mapped_column(Text)         # JSON：请求模板、响应路径、字段映射
-    freq: Mapped[str | None] = mapped_column(Text, default='manual')  # manual / daily / weekly
-    run_at: Mapped[str | None] = mapped_column(Text, default='08:30')  # HH:MM（北京时间）
+    name: Mapped[str | None] = mapped_column(big_text())            # 配置名，如「同花顺-黑色日盘」
+    source: Mapped[str | None] = mapped_column(big_text())          # ifind / wind，决定入库标签
+    kind: Mapped[str | None] = mapped_column(big_text())            # ifind_http / generic_json
+    base_url: Mapped[str | None] = mapped_column(big_text())
+    account: Mapped[str | None] = mapped_column(big_text())         # 账号 / AppID / 用户名
+    secret: Mapped[str | None] = mapped_column(big_text())          # 密码 / refresh_token / apikey
+    scope: Mapped[str | None] = mapped_column(big_text())           # JSON：items、metrics、days、code_suffix
+    options: Mapped[str | None] = mapped_column(big_text())         # JSON：请求模板、响应路径、字段映射
+    freq: Mapped[str | None] = mapped_column(big_text(), default='manual')  # manual / daily / weekly
+    run_at: Mapped[str | None] = mapped_column(big_text(), default='08:30')  # HH:MM（北京时间）
     weekday: Mapped[int | None] = mapped_column(Integer, default=1)    # 1=周一 … 7=周日
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
-    last_run: Mapped[str | None] = mapped_column(Text, default='')
-    last_status: Mapped[str | None] = mapped_column(Text, default='未运行')
-    last_message: Mapped[str | None] = mapped_column(Text, default='')
-    operator: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[str | None] = mapped_column(Text)
-    updated_at: Mapped[str | None] = mapped_column(Text, default='')
+    last_run: Mapped[str | None] = mapped_column(big_text(), default='')
+    last_status: Mapped[str | None] = mapped_column(big_text(), default='未运行')
+    last_message: Mapped[str | None] = mapped_column(big_text(), default='')
+    operator: Mapped[str | None] = mapped_column(big_text())
+    created_at: Mapped[str | None] = mapped_column(big_text())
+    updated_at: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class DataSyncJob(Base, MappingMixin):
@@ -351,16 +416,16 @@ class DataSyncJob(Base, MappingMixin):
     """
     __tablename__ = 'data_sync_jobs'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    source: Mapped[str | None] = mapped_column(Text)          # ifind / wind
-    scope: Mapped[str | None] = mapped_column(Text)           # JSON：品种、指标、区间
-    status: Mapped[str | None] = mapped_column(Text, default='待执行')
+    source: Mapped[str | None] = mapped_column(big_text())          # ifind / wind
+    scope: Mapped[str | None] = mapped_column(big_text())           # JSON：品种、指标、区间
+    status: Mapped[str | None] = mapped_column(big_text(), default='待执行')
     rows: Mapped[int | None] = mapped_column(Integer, default=0)
     inserted: Mapped[int | None] = mapped_column(Integer, default=0)
     updated: Mapped[int | None] = mapped_column(Integer, default=0)
-    operator: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[str | None] = mapped_column(Text)
-    finished_at: Mapped[str | None] = mapped_column(Text, default='')
-    message: Mapped[str | None] = mapped_column(Text, default='')
+    operator: Mapped[str | None] = mapped_column(big_text())
+    created_at: Mapped[str | None] = mapped_column(big_text())
+    finished_at: Mapped[str | None] = mapped_column(big_text(), default='')
+    message: Mapped[str | None] = mapped_column(big_text(), default='')
 
 
 class DataScopePreset(Base, MappingMixin):
@@ -442,6 +507,8 @@ class AgentTask(Base, MappingMixin):
     """
     __tablename__ = 'agent_tasks'
     id: Mapped[str] = mapped_column(Text, primary_key=True)   # uuid hex
+    kind: Mapped[str | None] = mapped_column(String(30), default='')
+    payload: Mapped[str | None] = mapped_column(big_text(), default='')
     thread_id: Mapped[str | None] = mapped_column(Text, default='')
     user_id: Mapped[int | None] = mapped_column(Integer)
     message: Mapped[str | None] = mapped_column(Text, default='')
@@ -451,6 +518,35 @@ class AgentTask(Base, MappingMixin):
     created_at: Mapped[str | None] = mapped_column(Text, default='')
     started_at: Mapped[str | None] = mapped_column(Text, default='')
     finished_at: Mapped[str | None] = mapped_column(Text, default='')
+
+
+class ViewpointCandidate(Base, MappingMixin):
+    __tablename__ = 'viewpoint_candidates'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
+    report_id: Mapped[int] = mapped_column(Integer, index=True)
+    publication_id: Mapped[int] = mapped_column(Integer, index=True)
+    author_id: Mapped[int | None] = mapped_column(Integer)
+    author_name: Mapped[str | None] = mapped_column(big_text(), default='')
+    report_title: Mapped[str | None] = mapped_column(big_text(), default='')
+    published_date: Mapped[str | None] = mapped_column(String(10))
+    commodity: Mapped[str | None] = mapped_column(String(191))
+    direction: Mapped[str | None] = mapped_column(String(20), default='')
+    horizon_days: Mapped[int | None] = mapped_column(Integer)
+    excerpt: Mapped[str | None] = mapped_column(big_text())
+    draft_basis: Mapped[str | None] = mapped_column(big_text(), default='')
+    source_method: Mapped[str | None] = mapped_column(String(20), default='rule')
+    reason: Mapped[str | None] = mapped_column(big_text(), default='')
+    status: Mapped[str | None] = mapped_column(String(20), default='待确认')
+    conditional: Mapped[int | None] = mapped_column(Integer, default=0)
+    confirmed_by: Mapped[str | None] = mapped_column(big_text(), default='')
+    confirmed_at: Mapped[str | None] = mapped_column(big_text(), default='')
+    created_at: Mapped[str | None] = mapped_column(big_text(), default='')
+
+class ViewpointScan(Base, MappingMixin):
+    __tablename__ = 'viewpoint_scans'
+    publication_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Viewpoint(Base, MappingMixin):
@@ -472,6 +568,19 @@ class Viewpoint(Base, MappingMixin):
     horizon_days: Mapped[int | None] = mapped_column(Integer, default=5)      # 观察期（自然日）
     expire_date: Mapped[str | None] = mapped_column(Text, default='')         # 结算日 = 基准日 + 观察期
     benchmark_indicator: Mapped[str | None] = mapped_column(Text, default='') # 用的哪个指标（溯源）
+    candidate_id: Mapped[int | None] = mapped_column(Integer, unique=True)
+    report_id: Mapped[int | None] = mapped_column(Integer)
+    publication_id: Mapped[int | None] = mapped_column(Integer)
+    source_excerpt: Mapped[str | None] = mapped_column(big_text(), default='')
+    report_title: Mapped[str | None] = mapped_column(big_text(), default='')
+    published_date: Mapped[str | None] = mapped_column(String(10), default='')
+    evaluation_threshold: Mapped[float | None] = mapped_column(Float, default=1.0)
+    benchmark_source: Mapped[str | None] = mapped_column(Text, default='')
+    benchmark_unit: Mapped[str | None] = mapped_column(Text, default='')
+    benchmark_manual: Mapped[int | None] = mapped_column(Integer, default=0)
+    result_source: Mapped[str | None] = mapped_column(Text, default='')
+    result_indicator: Mapped[str | None] = mapped_column(Text, default='')
+
     result_price: Mapped[float | None] = mapped_column(Float)                 # 结算价
     result_date: Mapped[str | None] = mapped_column(Text, default='')         # 实际取到的价格日期
     change_pct: Mapped[float | None] = mapped_column(Float)                   # 区间涨跌幅 %
@@ -485,12 +594,116 @@ class Viewpoint(Base, MappingMixin):
 # --------------------------------------------------------------------------
 # 引擎与会话
 # --------------------------------------------------------------------------
+def _connect_args(url: str) -> dict:
+    """连接参数按方言给。sqlite 的 timeout / check_same_thread 语义只有它认，
+    原样传给 Postgres 会直接 TypeError，所以必须分开。
+
+    prepare_threshold=None 关掉 psycopg3 的服务端预编译语句：Neon / PgBouncer 这类
+    连接池是事务级复用连接的，预编译语句跟着连接走，跨事务复用时必然撞
+    "prepared statement already exists"。关掉只是少一层优化，功能不受影响。
+    """
+    if url.startswith('sqlite'):
+        return {'timeout': 10, 'check_same_thread': False}
+    if url.startswith('postgresql'):
+        # 跨境/跨区访问托管库时单次建连可能就要几秒，超时给紧了一抖就启动失败
+        return {'connect_timeout': 30, 'prepare_threshold': None}
+    if url.startswith('mysql'):
+        # 云数据库常常带「自动暂停」，闲置后第一次连接要等计算节点冷启动，
+        # 实测能到十几秒，所以这里的超时不能按局域网的几秒来给。
+        return {'connect_timeout': 30, 'charset': 'utf8mb4'}
+    return {}
+
+
+def _bounded_connect(url: str, timeout: float = 8.0):
+    """带硬超时的建连，用于 psycopg 的 ``creator``。
+
+    为什么不能只靠 ``connect_timeout``：libpq 的那个参数只约束 TCP 握手，TLS 之后
+    的启动包 / 认证阶段不在它的计时范围内。跨境链路上出现过握手完成后会话被静默
+    丢弃的情况，于是 connect() 永久阻塞 —— 一个请求挂死，整个 worker 线程跟着陪葬。
+
+    所以每次尝试都丢到独立线程里跑，外面用 join 做硬截止；超时就丢弃这次尝试，
+    线程留着自生自灭（daemon，不会拦住进程退出），换下一次重试。
+
+    重试是必须的：同一条链路对同一个库的成功率实测只有一半上下，多试几次才可能
+    稳定拿到连接。次数用尽仍失败就抛出最后一次的真实异常，不吞原因。
+    """
+    import psycopg
+
+    attempts = int(os.getenv('DB_CONNECT_ATTEMPTS', '6'))
+    last_error: BaseException | None = None
+
+    for index in range(attempts):
+        box: dict[str, Any] = {}
+
+        def attempt() -> None:
+            try:
+                box['conn'] = psycopg.connect(url, connect_timeout=max(2, int(timeout)),
+                                              prepare_threshold=None)
+            except BaseException as exc:  # noqa: BLE001 - 原样抛给调用方
+                box['error'] = exc
+
+        worker = threading.Thread(target=attempt, daemon=True,
+                                  name='db-connect-%d' % index)
+        started = time.time()
+        worker.start()
+        worker.join(timeout + 2)
+
+        if worker.is_alive():
+            last_error = TimeoutError(
+                '建连超过 %.0fs 仍未完成（第 %d 次）' % (timeout + 2, index + 1))
+        elif 'conn' in box:
+            return box['conn']
+        else:
+            last_error = box.get('error') or RuntimeError('建连失败但未拿到异常')
+
+        # 立刻重试只会撞上同一个坏路径，退让一下让 libpq 有机会落到别的实例
+        if index + 1 < attempts:
+            time.sleep(min(0.5 * (index + 1), 2.0))
+
+    raise last_error if last_error else RuntimeError('无法连接数据库')
+
+
+_engine_kwargs: dict[str, Any] = {}
+if DB_URL.startswith('postgresql'):
+    # psycopg 只认 libpq 的 conninfo，不认 SQLAlchemy 的 "+psycopg" 方言后缀，
+    # 直接拿 DB_URL 去连会报 invalid connection option。
+    _libpq_url = DB_URL.replace('postgresql+psycopg://', 'postgresql://', 1)
+    # Postgres 走自建 creator：只有它能给建连加上「硬超时 + 重试」
+    _engine_kwargs['creator'] = lambda: _bounded_connect(
+        _libpq_url, float(os.getenv('DB_CONNECT_TIMEOUT', '8')))
+
 engine = create_engine(
     DB_URL,
     future=True,
     pool_pre_ping=True,
-    connect_args={'timeout': 10, 'check_same_thread': False},
+    pool_recycle=180,
+    pool_size=5,
+    max_overflow=5,
+    connect_args=_connect_args(DB_URL),
+    **_engine_kwargs,
 )
+
+
+def warmup_connections(count: int = 2, deadline: float = 90.0):
+    """启动时先把连接池焐热。
+
+    远程库第一次建连要几秒甚至要重试几轮，如果等用户第一次请求才去建，页面会一直
+    转圈。这里在启动阶段就把连接摆好，失败也只是记日志 —— 之后按需建连仍然可用。
+    """
+    from sqlalchemy import text
+
+    ok = 0
+    started = time.time()
+    for _ in range(count):
+        if time.time() - started > deadline:
+            break
+        try:
+            with engine.connect() as conn:
+                conn.execute(text('select 1'))
+            ok += 1
+        except Exception:
+            break
+    return ok
 
 if DB_URL.startswith('sqlite'):
 
@@ -521,22 +734,110 @@ def get_session():
 # 这三件事都是 DDL，SQLAlchemy 没有对应的 ORM 表达，只能落到 text() 上；
 # 除此之外整个后端不再出现手写 SQL。
 # --------------------------------------------------------------------------
+_SCHEMA_CHECKED = False
+
+
 def create_schema() -> None:
-    """按模型建表（已存在则跳过）。新库一次到位，老库由各 engine 的补列迁移兜底。"""
+    """按模型建表（已存在则跳过）。新库一次到位，老库由各 engine 的补列迁移兜底。
+
+    四个 engine 的 migrate 都会调这里。create_all(checkfirst=True) 对每张表各查一次
+    存在性，SQLite 本地无感，但连远程库时 4 × 21 次往返能把启动拖到一分钟。所以先用
+    一次 get_table_names 判断是否全都齐了——齐了就直接返回。
+    """
+    global _SCHEMA_CHECKED
+    if _SCHEMA_CHECKED:
+        return
+    existing = set(inspect(engine).get_table_names())
+    if not set(Base.metadata.tables) - existing:
+        _SCHEMA_CHECKED = True
+        return
     Base.metadata.create_all(engine, checkfirst=True)
+    _SCHEMA_CHECKED = True
 
 
-def table_columns(table: str) -> set[str]:
-    """读取表当前列名。每次新建 Inspector，避免反射结果被缓存而看不到刚补的列。"""
-    return {column['name'] for column in inspect(engine).get_columns(table)}
+def schema_fingerprint() -> str:
+    """由模型定义算出的结构指纹：表名 + 列名。列一变，指纹就变。
+
+    不用手写版本号，是因为手写的那个一定会忘——加完列忘了改，线上就直接报
+    "列不存在"。指纹跟着代码走，改模型必然改指纹，老库自动回到完整补列流程。
+    """
+    parts = []
+    for name in sorted(Base.metadata.tables):
+        table = Base.metadata.tables[name]
+        parts.append(name + ':' + ','.join(sorted(column.name for column in table.columns)))
+    return hashlib.sha1('|'.join(parts).encode('utf-8')).hexdigest()[:16]
+
+
+def schema_current(session: Session) -> bool:
+    """库结构是否已经和当前模型完全一致。
+
+    为真时整段补列逻辑可以跳过：远程库上每次启动要做几十次结构查询，每个往返
+    几百毫秒，累计十几秒；而 99% 的启动结构根本没变过。
+    """
+    try:
+        existing = set(inspect(engine).get_table_names())
+        if set(Base.metadata.tables) - existing:
+            return False
+        return has_flag(session, 'schema:' + schema_fingerprint())
+    except Exception:
+        # 表还没建全（甚至库还是空的）时任何反射都可能抛，一律当作"需要初始化"
+        return False
+
+
+def mark_schema_current(session: Session) -> None:
+    """记下当前结构指纹。必须放在所有补列与一次性迁移都跑完之后。"""
+    set_flag(session, 'schema:' + schema_fingerprint())
+
+
+def prefetch_columns(session: Session) -> None:
+    """一次性把全部表的列名装进会话缓存，供后续 add_columns 零成本命中。
+
+    get_multi_columns 一条语句拿回所有表的结构；个别方言不支持时退回逐表查询，
+    行为不变，只是慢一点。
+    """
+    cache = session.info.setdefault('db.table_columns', {})
+    if cache:
+        return
+    inspector = inspect(engine)
+    try:
+        multi = inspector.get_multi_columns()
+    except (NotImplementedError, AttributeError):
+        multi = None
+    if multi:
+        for table, columns in multi.items():
+            cache[table] = {column['name'] for column in columns}
+
+
+def table_columns(table: str, session=None) -> set[str]:
+    """读取表当前列名。
+
+    传了 session 就按会话缓存：一次初始化会对同一张表检查好几轮列，远程库上每轮
+    都是一次网络往返。缓存只活在单个 Session 里，不会跨进程变陈旧；刚 ALTER 出来
+    的列由 add_columns 写回同一份缓存，所以同一轮里不会重复补列。
+    """
+    if session is None:
+        return {column['name'] for column in inspect(engine).get_columns(table)}
+    cache = session.info.setdefault('db.table_columns', {})
+    if table not in cache:
+        cache[table] = {column['name'] for column in inspect(engine).get_columns(table)}
+    return cache[table]
 
 
 def add_columns(session: Session, table: str, columns: dict[str, str]) -> None:
-    """幂等补列。SQLite 不支持一次 ALTER 多列，只能逐条执行。"""
-    existing = table_columns(table)
+    """幂等补列。SQLite 不支持一次 ALTER 多列，只能逐条执行。
+
+    补列定义是按 SQLite 写的（``TEXT DEFAULT ''``）。MySQL 的 TEXT 列不允许有默认值，
+    原样执行会报 "BLOB/TEXT column can't have a default value"；而这里补出来的都是
+    短文本（手机号、标题、时间戳），降到 VARCHAR(255) 语义不变。
+    """
+    existing = table_columns(table, session)
+    is_mysql = engine.dialect.name == 'mysql'
     for name, definition in columns.items():
-        if name not in existing:
-            session.execute(text('ALTER TABLE %s ADD COLUMN %s %s' % (table, name, definition)))
+        if name in existing:
+            continue
+        ddl = definition.replace('TEXT', 'VARCHAR(255)') if is_mysql else definition
+        session.execute(text('ALTER TABLE %s ADD COLUMN %s %s' % (table, name, ddl)))
+        existing.add(name)
 
 
 def has_flag(session: Session, name: str) -> bool:

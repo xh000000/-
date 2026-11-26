@@ -1,7 +1,7 @@
 <template>
   <div>
     <PageHead title="研报中心" description="按「我的 / 共享 / 公共」查看研报；状态口径为待提交 → 待审批 → 已通过 → 已发布，驳回后回到可编辑状态。">
-      <el-button type="primary" :disabled="!canCreate" @click="dialogVisible = true">添加研报</el-button>
+      <el-button type="primary" :disabled="!canCreate" @click="dialogVisible = true"><el-icon style="margin-right:6px"><DocumentAdd /></el-icon>新建研报</el-button>
     </PageHead>
 
     <div class="filter-bar">
@@ -37,7 +37,7 @@
       <ReportTable :reports="list" @open="openReport" @more="openMore" />
     </div>
 
-    <NewReportDialog v-model="dialogVisible" @created="openReport" />
+    <NewReportDialog v-model="dialogVisible" @created="createdReport" />
     <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" />
   </div>
 </template>
@@ -45,6 +45,8 @@
 <script setup>
 import { computed, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
+import { createdReportRoute } from '../utils/reportCreation';
+import { DocumentAdd } from '@element-plus/icons-vue';
 import PageHead from '../components/PageHead.vue';
 import ReportTable from '../components/ReportTable.vue';
 import NewReportDialog from '../components/NewReportDialog.vue';
@@ -54,6 +56,7 @@ import { dateOnly, parseJSON, sortReports, statusText } from '../utils/format';
 
 const router = useRouter();
 const dialogVisible = ref(false);
+const createdReport = (id, options) => router.push(createdReportRoute(id, options));
 const moreVisible = ref(false);
 const moreId = ref(null);
 

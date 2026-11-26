@@ -18,8 +18,45 @@ import json
 import math
 import re
 
-from sqlalchemy import func, select, update, or_, text
+from sqlalchemy import func, inspect, select, update, or_, text
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+
+def _insert_ignore(session, values: dict) -> bool:
+    """幂等写入一条观测，命中唯一键就跳过；返回是否真的插进去了。
+
+    三种库的写法互不兼容，这里按方言分开：
+
+    - SQLite / PostgreSQL：``ON CONFLICT DO NOTHING`` 再靠 ``RETURNING`` 判断有没有插入；
+    - MySQL：既没有 ``ON CONFLICT`` 也没有 ``RETURNING``，只能用 ``INSERT IGNORE`` 看
+      rowcount。代价是 IGNORE 会连带吞掉截断之类的其它告警，但入库前已经做过长度与
+      数值清洗，这里只可能是唯一键冲突。
+    """
+    dialect = session.get_bind().dialect.name
+    if dialect == 'mysql':
+        result = session.execute(mysql.insert(Observation).prefix_with('IGNORE').values(**values))
+        return result.rowcount == 1
+    builder = postgresql if dialect == 'postgresql' else sqlite
+    inserted = session.execute(
+        builder.insert(Observation).values(**values)
+        .on_conflict_do_nothing(index_elements=['source', 'indicator', 'date'])
+        .returning(Observation.id)
+    ).scalar_one_or_none()
+    return inserted is not None
+
+
+def _ensure_unique_index(session, name: str, table: str, columns: str) -> None:
+    """建立唯一索引，已存在则跳过。MySQL 没有 ``CREATE INDEX IF NOT EXISTS``。"""
+    bind = session.get_bind()
+    if bind.dialect.name == 'mysql':
+        existing = {index['name'] for index in inspect(bind).get_indexes(table)}
+        if name in existing:
+            return
+        session.execute(text('CREATE UNIQUE INDEX %s ON %s (%s)' % (name, table, columns)))
+        return
+    session.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s (%s)'
+                         % (name, table, columns)))
 
 from db import (
     Commodity, DataSource, DataSourceConfig, DataScopePreset, DataSyncJob, DimGroup, DimIndicator,
@@ -724,8 +761,8 @@ def migrate_observation_uniqueness(session) -> int:
     for row, key in survivors:
         row.source, row.indicator, row.date = key
     session.flush()
-    session.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS uq_observation_point '
-                         'ON observations (source, indicator, date)'))
+    _ensure_unique_index(session, 'uq_observation_point', 'observations',
+                         'source, indicator, date')
     set_flag(session, 'observation-unique-v1')
     return removed
 
@@ -751,11 +788,7 @@ def apply(session, rows: list[dict], operator: str) -> dict:
             indicator_id = ensure_indicator(session, row['indicator']).id
             indicator_ids[row['indicator']] = indicator_id
         point = {k: row[k] for k in ('source', 'indicator', 'date', 'value', 'unit')}
-        result = session.execute(sqlite_insert(Observation)
-                                 .values(**point, uploaded_by=operator, indicator_id=indicator_id)
-                                 .on_conflict_do_nothing(index_elements=['source', 'indicator', 'date'])
-                                 .returning(Observation.id)).scalar_one_or_none()
-        if result is not None:
+        if _insert_ignore(session, {**point, 'uploaded_by': operator, 'indicator_id': indicator_id}):
             inserted += 1
             continue
         changed = session.execute(update(Observation).where(

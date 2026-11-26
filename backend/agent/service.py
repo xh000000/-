@@ -247,6 +247,14 @@ def _run_task(task_id: str) -> None:
             _mark(task_id, '失败', error='任务发起账号已不存在或停用')
             return
         user = {'id': account.id, 'name': account.name, 'role': account.role}
+        if task.kind == 'viewpoint-extract':
+            import viewpoint_ai
+            viewpoint_ai.run_task(task.id,user)
+            return
+        if task.kind == 'report-skill':
+            import report_writer
+            report_writer.run_task(task.id, user)
+            return
         if task.message.startswith('/pipeline '):  # AI 日报流水线任务
             _run_pipeline_task(s, task, user)
             return

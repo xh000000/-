@@ -1,4 +1,4 @@
-"""AI 日报流水线：取数 → 逐板块写稿 → 自动建报告 → 推进到「研究复核」。
+"""AI 日报流水线：取数 → 逐板块写稿 → 自动建报告 → 保留草稿供人工核对。
 
 流程（对标同业的「分钟级初稿 + 人工复核」模式）
 --------------------------------------------------
@@ -7,8 +7,7 @@
 3. 每个章节：按章节挂载的品种取平台指标数据 + 资料库摘录，一次 LLM 调用写正文，
    再走 /api/chapter/save 落稿（版本快照 + 留痕）；
 4. 整篇标记 ai_draft=1（前端列表显示「AI 初稿」徽标），并追加留痕事件；
-5. 自动「提交」进入研究复核——审批流的后续节点（复核→合规→发布）只允许
-   对应角色的人工操作，Agent 无法越过。
+5. 保留草稿，人工核对后在编辑器中提交审批。
 
 触发方式
 --------
@@ -224,17 +223,9 @@ def run(s, user: dict, category_id: int = 0) -> dict:
     platform.event(s, r, user, 'AI 初稿', 'AI 日报流水线生成整篇初稿，待人工复核')
     s.commit()
 
-    # 6. 送审：只推进到「研究复核」，后续节点必须人工操作
-    submitted, note = False, ''
-    result, status = platform.transition(s, r, {'action': '提交', 'note': ''}, user)
-    if status == 200:
-        submitted = True
-    else:
-        note = json.dumps(result, ensure_ascii=False)[:200]
-    s.commit()
-
-    return {'report_id': rid, 'title': title, 'status': '研究复核' if submitted else '草稿',
-            'submitted': submitted, 'submit_note': note,
+    # Compatibility path for scheduled/legacy clients: keep drafts for explicit human submission.
+    return {'report_id': rid, 'title': title, 'status': r.status,
+            'submitted': False, 'submit_note': '请核对正文后在编辑器中手动送审',
             'sections': written, 'finished_at': _stamp()}
 
 

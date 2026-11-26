@@ -26,8 +26,32 @@ _LIB_SNIPPET = 400    # 资料库摘要长度
 
 
 def _dump(value) -> str:
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    return text if len(text) <= _CLIP else text[:_CLIP] + '…（结果过长已截断，请缩小查询范围）'
+    # Trim values before serialization: cutting the JSON string corrupts tool responses.
+    value = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    def encode(): return json.dumps(value, ensure_ascii=False)
+    if len(encode()) <= _CLIP: return encode()
+    if isinstance(value, dict): value['truncated'] = True
+    while len(encode()) > _CLIP:
+        lists, strings = [], []
+        def visit(node):
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if isinstance(child, str) and len(child) > 81: strings.append((len(child), node, key))
+                    else: visit(child)
+            elif isinstance(node, list):
+                if len(node) > 1: lists.append((len(json.dumps(node, ensure_ascii=False)), node))
+                for index, child in enumerate(node):
+                    if isinstance(child, str) and len(child) > 81: strings.append((len(child), node, index))
+                    else: visit(child)
+        visit(value)
+        if lists:
+            max(lists, key=lambda x:x[0])[1].pop()
+        elif strings:
+            _, parent, key = max(strings, key=lambda x:x[0])
+            parent[key] = parent[key][:max(80, len(parent[key]) // 2)] + '…'
+        else:
+            return json.dumps({'error': '结果过长，请缩小查询范围', 'truncated': True}, ensure_ascii=False)
+    return encode()
 
 
 def _user_dict(u) -> dict:
@@ -169,10 +193,9 @@ def _search_library(user):
 # ---------------------------------------------------------------------------
 def _save_chapter_draft(user):
     def run(report_id: int, section_id: str, content: str, title: str = '') -> str:
-        """把候选草稿写入研报的一个章节（仅草稿/已退回状态、本人可编辑的章节）。
+        """保存研报某章的候选任务（仅草稿/已退回状态、本人可编辑的章节）。
 
-        会替换该章节的原有文字组件（图表/表格/图片组件保留），
-        平台自动生成新版本与操作留痕。写之前先调 get_report 拿 section_id 与 revision。
+        只保存候选任务，不修改研报正文或版本。用户须在编辑器核对后选择追加或替换。
         """
         import app as platform  # 运行时才导入，避免与 app.py 循环依赖
         if len(content or '') < 10:
@@ -193,37 +216,68 @@ def _save_chapter_draft(user):
                 return _dump({'error': '章节不存在，请先用 get_report 查看章节列表'})
             if not manual.section_allowed(r, user, section):
                 return _dump({'error': '当前账号无权编辑此章节（或章节已提交锁定）'})
-            kept = [b for b in section['blocks'] if b['type'] != 'text']
-            data = {'id': int(report_id), 'section_id': section_id, 'revision': section['revision'],
-                    'blocks': [{'id': engine.uid(), 'type': 'text', 'span': 12,
-                                'title': str(title or '')[:100], 'text': content}, *kept]}
-            result, status = manual.handle(s, '/api/chapter/save', data, user,
-                                           platform.stamp, platform.snapshot, platform.event, platform.checks)
-            if status != 200:
-                s.rollback()
-                return _dump(result)
-            # 合规标记：Agent 产出的报告永远带 AI 初稿标识，并额外留痕
-            r.ai_draft = 1
-            platform.event(s, r, user, 'AI 初稿', 'Agent 写入章节「%s」，内容须人工核对后方可送审' % section.get('title', section_id))
-            s.commit()
-            return _dump({'ok': True, 'report_id': int(report_id), 'section_id': section_id,
-                          'new_version': r['version'], 'note': '已写入并留痕；内容为候选草稿，须人工核对后方可送审'})
+            from sqlalchemy import update
+            s.execute(update(Report).where(Report.id==r.id).values(version=Report.version));s.expire_all()
+            r=s.get(Report,int(report_id));section=next((x for x in json.loads(r.document)['sections'] if x['id']==section_id),None)
+            if not section or not manual.section_allowed(r,user,section):return _dump({'error':'章节权限或状态已变化'})
+            import report_writer
+            try:return _dump(report_writer.chat_candidate(s,user,r,section,content))
+            except Exception as exc:s.rollback();return _dump({'error':str(exc)[:300]})
     return run
 
 
 # ---------------------------------------------------------------------------
 # 注册表与构建
 # ---------------------------------------------------------------------------
+def _list_report_skills(user):
+    def run() -> str:
+        """发现可用的研报写作 Skill，返回名称、适用场景和版本；正文按需加载。"""
+        import report_skill_engine
+        with SessionFactory() as s:
+            values=[{k:x[k] for k in ('id','name','description','version')} for x in report_skill_engine.catalog(s) if x['enabled']]
+        return json.dumps({'skills':values},ensure_ascii=False)
+    return run
+
+
+def _load_report_skill(user):
+    def run(skill_id: str) -> str:
+        """按精确 Skill ID 加载已启用的 SKILL.md 写作方法，不执行脚本。"""
+        import report_skill_engine
+        try:
+            with SessionFactory() as s: skill=report_skill_engine.selected(s,[skill_id])[0]
+            return json.dumps({**skill,'resources':list((skill.get('resources') or {}).keys()),'reference_context':report_skill_engine.context(skill)},ensure_ascii=False)
+        except ValueError as exc: return _dump({'error':str(exc)})
+    return run
+
+
+def _generate_report_with_skill(user):
+    def run(report_id: int, skill_id: str) -> str:
+        """为已有草稿研报排队生成整篇候选。多人研报发起人可生成整篇，协作者仅生成本人章节；不保存、不送审，完成后由各章负责人核对采用。"""
+        if user['role'] not in ('admin','researcher'): return _dump({'error':'无权生成研报'})
+        import report_writer
+        try:
+            with SessionFactory() as s:
+                report=report_writer.writable(s,report_id,user)
+                ids=[x['id'] for x in json.loads(report.document)['sections'] if report_writer.can_generate(report,user,x)]
+                result=report_writer.enqueue_job(s,user,{'report_id':report.id,'version':report.version,'skill_ids':[skill_id],'section_ids':ids,'library_ids':[]})
+            return _dump({**result,'report_id':report_id,'message':'任务已排队，请到研报编辑器 → AI / Skill 生成查看进度与候选，确认后再保存'})
+        except Exception as exc: return _dump({'error':str(exc)[:200]})
+    return run
+
+
 def _registry(user) -> list[tuple[str, str, object]]:
     """(工具名, 描述, 执行函数)。描述就是给模型看的说明书，要写清何时该用。"""
     return [
+        ('list_report_skills', '发现平台内置和自定义的研报写作 Skill', _list_report_skills(user)),
+        ('load_report_skill', '按ID加载已启用的 SKILL.md 方法和版本', _load_report_skill(user)),
+        ('generate_report_with_skill', '对已有本人草稿调用 Skill 生成候选任务，待用户在编辑器核对保存', _generate_report_with_skill(user)),
         ('list_reports', '检索当前用户可见的研报列表，可按状态（草稿/研究复核/合规审核/待发布/已发布/已退回）或标题关键词过滤', _list_reports(user)),
         ('get_report', '读取一篇研报的完整章节结构与内容；要把草稿写入某章节前，必须先调用它获取 section_id 和 revision', _get_report(user)),
         ('search_indicators', '按关键词检索平台已入库的数据指标（来源+指标名），是取数前的入口', _search_indicators(user)),
         ('query_indicator', '取某来源某指标的时间序列与统计摘要，写品种观点时用真实数据支撑', _query_indicator(user)),
         ('list_commodities', '读取期货品种库（板块→品种→合约代码），对齐日度策略 01～06 板块', _list_commodities(user)),
         ('search_library', '按关键词检索资料库文档并返回正文摘要', _search_library(user)),
-        ('save_chapter_draft', '把候选章节草稿写入草稿状态研报的指定章节（保留图表组件、生成新版本与留痕）；仅限本人可编辑章节', _save_chapter_draft(user)),
+        ('save_chapter_draft', '保存本章候选任务，待用户在编辑器核对采用；不修改研报正文，仅限本人可编辑章节', _save_chapter_draft(user)),
     ]
 
 

@@ -16,7 +16,12 @@ def load_env() -> None:
 
     已存在的环境变量优先（命令行临时覆盖不会被文件盖掉）；只做 KEY=VALUE，
     不引入 python-dotenv，保持后端零额外依赖。.env 已在 .gitignore 内。
+
+    SKIP_DOTENV=1 时整个跳过：托管平台的环境变量由平台注入，而沙箱是增量覆盖的，
+    上一次部署留在里面的 .env 不会被删掉，读它等于把配置悄悄换回旧值。
     """
+    if os.getenv('SKIP_DOTENV'):
+        return
     for candidate in (ROOT / '.env', Path(__file__).resolve().parent / '.env'):
         if not candidate.is_file():
             continue

@@ -79,6 +79,13 @@ def cookie_name() -> str:
 def init() -> None:
     """建表 + 幂等迁移。各 engine 的 migrate 只负责补列与一次性数据迁移。"""
     with SessionFactory() as session:
+        # 结构没变就直接返回。远程库（Neon / 云数据库）上整套补列检查有几十次
+        # 网络往返，十几秒起步；而绝大多数启动结构根本没变过。
+        if database.schema_current(session):
+            return
+        database.create_schema()
+        # 先把列清单一次性抓回来，后面 13 处 add_columns 都命中缓存，不再逐表往返
+        database.prefetch_columns(session)
         engine.migrate(session)
         manual.migrate(session)
         library.migrate(session)
@@ -88,9 +95,22 @@ def init() -> None:
         datasource.migrate_observation_uniqueness(session)
         # 裸名字 → 指标主数据（dim_groups / dim_indicators），幂等，每次启动都兜底回填
         datasource.migrate_dictionary(session)
+        database.add_columns(session, 'agent_tasks', {'kind': "VARCHAR(30) DEFAULT ''", 'payload': "TEXT DEFAULT ''"})
+        database.add_columns(session, 'viewpoint_candidates', {'draft_basis': "TEXT DEFAULT ''", 'source_method': "VARCHAR(20) DEFAULT 'rule'"})
+        database.add_columns(session, 'viewpoints', {
+            'candidate_id': 'INTEGER', 'report_id': 'INTEGER', 'publication_id': 'INTEGER',
+            'source_excerpt': "TEXT DEFAULT ''", 'report_title': "TEXT DEFAULT ''",
+            'published_date': "VARCHAR(10) DEFAULT ''", 'evaluation_threshold': 'FLOAT DEFAULT 1.0',
+            'benchmark_source': "TEXT DEFAULT ''", 'benchmark_unit': "TEXT DEFAULT ''",
+            'benchmark_manual': 'INTEGER DEFAULT 0', 'result_source': "TEXT DEFAULT ''",
+            'result_indicator': "TEXT DEFAULT ''"})
+        datasource._ensure_unique_index(session, 'uq_viewpoint_candidate', 'viewpoints', 'candidate_id')
         database.add_columns(session, 'reports', {'scheduled_at': "TEXT DEFAULT ''",
                                                   'ai_draft': 'INTEGER DEFAULT 0',
                                                   'ai_summary': "TEXT DEFAULT ''"})
+        session.commit()
+        # 所有补列都成功落库之后才记账，中途失败下次仍会完整重跑
+        database.mark_schema_current(session)
         session.commit()
 
 
@@ -126,6 +146,9 @@ def event(s: Session, r, u, action: str, note: str = '') -> None:
         s.add(PublicationHistory(report_id=r['id'], version=r['version'], document=r['document'],
                                  config=r['config_snapshot'], metadata_=r['metadata'], body=r['body'],
                                  published_at=at))
+        s.flush()
+        import viewpoint_tracking
+        viewpoint_tracking.sync_published(s)
     if action == '通过' and r['status'] == '待发布':
         r.approved_at = stamp()
 
@@ -185,6 +208,9 @@ def publish_due() -> None:
                 config=report.config_snapshot, metadata_=report.metadata_, body=report.body, published_at=at))
             session.add(Event(report_id=report.id, actor='系统', action='发布',
                               note='定时发布到点自动执行', version=report.version, at=at))
+        session.flush()
+        import viewpoint_tracking
+        viewpoint_tracking.sync_published(session)
         session.commit()
 
 
@@ -211,6 +237,12 @@ def scheduler() -> None:
         except Exception as exc:
             print('scheduler-sync', type(exc).__name__, flush=True)
         try:
+            import viewpoint
+            with SessionFactory() as session:
+                viewpoint.settle_due(session)
+        except Exception as exc:
+            print('scheduler-viewpoints', type(exc).__name__, flush=True)
+        try:
             import agent.pipeline
             agent.pipeline.schedule_due()  # AI 日报定时流水线（AGENT_PIPELINE_TIME 未配置时为空操作）
         except ImportError:
@@ -222,10 +254,26 @@ def scheduler() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    init()
+    # 远程库第一次建连要几秒，链路抖动时还要重试几轮。先把连接池焐热再对外服务，
+    # 免得用户第一个请求就撞上建连；失败也不致命，后续按需建连仍然可用。
+    warmed = database.warmup_connections(count=2)
+    print('db warmup: %d 条连接就绪' % warmed, flush=True)
+    # 远程库的建连会偶发抖动（跨境链路、托管库冷启动唤醒），第一次失败不代表配置错。
+    # 这里重试三次再放弃，避免一次握手超时就让整个服务起不来。
+    for attempt in range(1, 4):
+        try:
+            init()
+            break
+        except Exception as exc:
+            print('init 失败（第 %d 次）：%s: %s' % (attempt, type(exc).__name__, exc), flush=True)
+            if attempt == 3:
+                raise
+            time.sleep(3)
     threading.Thread(target=scheduler, daemon=True).start()
     try:
         import agent.service
+        import report_writer
+        report_writer.recover_interrupted()
         agent.service.start_worker()  # Agent 后台任务 worker（langchain 未安装时跳过）
     except ImportError as exc:
         print('agent disabled:', exc, flush=True)
@@ -1801,3 +1849,9 @@ except ImportError as exc:
 import viewpoint as viewpoint_routes
 app.include_router(viewpoint_routes.router)
 print('viewpoint layer mounted: /api/viewpoints/*', flush=True)
+
+import viewpoint_tracking
+app.include_router(viewpoint_tracking.router)
+
+import report_writer
+app.include_router(report_writer.router)

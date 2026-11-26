@@ -1,4 +1,6 @@
 """Public providers: preserve provenance, units and errors without real network."""
+from test_environment import prepare
+prepare()
 import json
 import unittest
 from types import SimpleNamespace

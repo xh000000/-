@@ -4,6 +4,8 @@
 工具链路用内嵌子进程直接调用 agent.tools 验证（读 + 受限写 + 留痕）。
 运行方式与 test_workflow 一致：python backend/test_agent.py
 """
+from test_environment import prepare
+prepare()
 import unittest, tempfile, subprocess, os, sys, time, json, urllib.request, urllib.error, http.cookiejar, socket
 from pathlib import Path
 
@@ -177,15 +179,17 @@ out = json.loads(built['save_chapter_draft'].invoke(
     {'report_id': rid, 'section_id': target['section_id'], 'content': content, 'title': '测试'}))
 assert out.get('ok'), out
 
-# 版本 +1、留痕、正文可见；Agent 写入必须打上 AI 初稿标记
+# 只新增候选，不修改正文、报告版本或图表。
 with SessionFactory() as s:
     r = s.get(Report, rid)
-    assert r.version >= 2, r.version
-    assert r.ai_draft == 1, r.ai_draft
-    events = s.execute(select(Event).where(Event.report_id == rid)).scalars().all()
-    assert any(x.action == '保存章节' for x in events), [x.action for x in events]
-    assert any(x.action == 'AI 初稿' for x in events), [x.action for x in events]
-    assert content in json.loads(r.document)['sections'][1]['blocks'][0]['text']
+    assert r.version == 1, r.version
+    assert r.ai_draft == 0, r.ai_draft
+    assert content not in r.body
+    task=s.get(db.AgentTask,out['task_id'])
+    assert task.kind=='report-skill' and task.status=='已完成'
+    result=json.loads(task.result)
+    assert result['sections'][0]['body']==content
+    assert json.loads(task.payload)['origin']=='chat'
 
 # 已送审的报告不可写
 with SessionFactory() as s:
@@ -205,6 +209,10 @@ out = json.loads(built['query_indicator'].invoke({'source': 'Wind', 'indicator':
 assert out['stats']['latest'] == 123456, out
 out = json.loads(built['list_commodities'].invoke({}))
 assert out['sectors'], out
+out = json.loads(built['list_report_skills'].invoke({}))
+assert any(x['id']=='daily-research' for x in out['skills']), out
+out = json.loads(built['load_report_skill'].invoke({'skill_id':'daily-research'}))
+assert '日度与周度研究写作' in out['markdown'], out
 out = json.loads(built['search_library'].invoke({'keyword': '不存在的东西'}))
 assert out['count'] == 0, out
 print('AGENT_TOOLS_OK')
@@ -214,9 +222,18 @@ print('AGENT_TOOLS_OK')
 class AgentTools(unittest.TestCase):
     """工具链路（含受限写 + 留痕）在内嵌子进程里直接验证。"""
 
+    def test_tool_json_is_valid_when_large(self):
+        from agent.tools import _dump, _CLIP
+        for value in ({'sectors': [{'name': '品种', 'items': list(range(2000))}]},
+                      {str(i): 'x' * 81 for i in range(100)}, {'text': 'a' * 10000}):
+            output = _dump(value)
+            self.assertLessEqual(len(output), _CLIP)
+            self.assertTrue(json.loads(output)['truncated'])
+
     def test_tools(self):
-        proc = subprocess.run([sys.executable, '-c', TOOLS_SCRIPT],
-                              capture_output=True, text=True, timeout=300, cwd=str(BACKEND.resolve()))
+        with tempfile.TemporaryDirectory() as data_dir:
+            proc = subprocess.run([sys.executable, '-c', TOOLS_SCRIPT], env={**os.environ, 'DATA_DIR': data_dir},
+                                  capture_output=True, text=True, timeout=300, cwd=str(BACKEND.resolve()))
         self.assertIn('AGENT_TOOLS_OK', proc.stdout,
                       'stdout: %s\nstderr: %s' % (proc.stdout[-2000:], proc.stderr[-3000:]))
 
@@ -267,17 +284,17 @@ with SessionFactory() as s:
     s.commit()
 
 assert summary['report_id'], summary
-assert summary['submitted'] and summary['status'] == '研究复核', summary
+assert not summary['submitted'] and summary['status'] == '草稿', summary
 assert any(x['ok'] for x in summary['sections']), summary
 
 with SessionFactory() as s:
     r = s.get(Report, summary['report_id'])
     assert r.ai_draft == 1, r.ai_draft
-    assert r.status == '研究复核', r.status
+    assert r.status == '草稿', r.status
     assert '风险提示' in (r.body or ''), (r.body or '')[:200]
     events = s.execute(select(Event).where(Event.report_id == r.id)).scalars().all()
     assert any(x.action == 'AI 初稿' for x in events), [x.action for x in events]
-    assert any(x.action == '提交' for x in events), [x.action for x in events]
+    assert not any(x.action == '提交' for x in events), [x.action for x in events]
 
 # 定时触发函数：未配置时必须为空操作
 os.environ.pop('AGENT_PIPELINE_TIME', None)
@@ -287,7 +304,7 @@ print('AGENT_PIPELINE_OK')
 
 
 class AgentPipeline(unittest.TestCase):
-    """AI 日报流水线：建报告 → 逐章写稿 → AI 标记 → 自动送研究复核（不触网）。"""
+    """AI 日报流水线：建报告 → 逐章写稿 → AI 标记 → 保留草稿人工送审（不触网）。"""
 
     def test_pipeline(self):
         proc = subprocess.run([sys.executable, '-c', PIPELINE_SCRIPT],

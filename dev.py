@@ -138,21 +138,35 @@ def api_ready(timeout=0.6):
         return False
 
 
-def start_backend():
+def start_backend(log_path=None):
     server = os.path.join(BASE_DIR, 'backend', 'server.py')
     if not os.path.isfile(server):
         raise SystemExit('未找到后端入口：' + server)
     env = dict(os.environ, HOST=API_HOST, PORT=API_PORT)
     env.pop('API_ONLY', None)
-    process = subprocess.Popen([sys.executable, server], cwd=os.path.join(BASE_DIR, 'backend'), env=env)
+    # log_path 给了就把后端的 stdout/stderr 落到文件，托管环境里拿不到子进程输出，
+    # 排查启动失败只能靠它。
+    sink = open(log_path, 'ab', buffering=0) if log_path else None
+    try:
+        process = subprocess.Popen([sys.executable, server], cwd=os.path.join(BASE_DIR, 'backend'), env=env,
+                                   stdout=sink or None, stderr=subprocess.STDOUT if sink else None)
+    finally:
+        if sink:
+            sink.close()
     atexit.register(lambda: process.poll() is None and process.terminate())
-    for _ in range(60):
+    # 用 SQLite 时后端 2 秒内就能起来；连远程库（Neon / 云数据库）时，初始化要对
+    # 21 张表逐张做列检查，每张一个网络往返，十几秒是正常的，所以超时放到 60 秒。
+    deadline = time.time() + float(os.getenv('BACKEND_START_TIMEOUT', '60'))
+    while time.time() < deadline:
         if api_ready(0.4):
             return process
         if process.poll() is not None:
             raise SystemExit('后端启动失败，退出码 %s' % process.returncode)
         time.sleep(0.25)
-    raise SystemExit('后端 15 秒内未就绪：' + API_BASE)
+    # 超时说明后端还在初始化（远程库常见），但不能留着它再起一个新的，否则会越滚越多
+    if process.poll() is None:
+        process.terminate()
+    raise SystemExit('后端 %s 秒内未就绪：%s' % (os.getenv('BACKEND_START_TIMEOUT', '60'), API_BASE))
 
 
 if __name__ == '__main__':

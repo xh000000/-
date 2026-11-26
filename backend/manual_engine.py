@@ -502,12 +502,25 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         result=e.handle(s,path,d,u,stamp,snapshot,event,checks)
         if result[1]!=200:return result
         rid=result[0]['id'];r=s.get(Report,rid);cfg=json.loads(r.config_snapshot);doc=json.loads(r.document);cfg['layout']=layout;doc['layout']=layout
+        assignment_map={}
+        if 'section_assignments' in d:
+            items=d['section_assignments']
+            if collaboration!='shared' or not isinstance(items,list) or len(items)!=len(doc['sections']):raise ValueError('章节分工与当前报告结构不一致，请重新选择分类或继承报告')
+            valid_ids={x['id'] for x in doc['sections']};allowed={u['id'],*collaborators}
+            for item in items:
+                if not isinstance(item,dict):raise ValueError('章节分工格式无效')
+                sid=item.get('section_id');people=item.get('editors')
+                if sid not in valid_ids or sid in assignment_map:raise ValueError('章节不存在或重复')
+                if not isinstance(people,list) or not people:raise ValueError('每章至少需要一位编辑人')
+                editors=list(dict.fromkeys(int(x) for x in people))
+                if not set(editors)<=allowed:raise ValueError('章节编辑人必须为创建人或本次选择的协作人')
+                assignment_map[sid]=editors
         for section in doc['sections']:
             template=next((x for x in cfg['sections'] if x['id']==section['id']),{})
             # 日度策略各章节按合集对应到板块品种；其他分类未配置时退回本报告的品种
             linked=template.get('commodity_ids')
             if linked is None or (not linked and '日度策略' not in (cat.name or '')):linked=[commodity.id]
-            section.update(editors=[u['id']],tags=[],type=template.get('type',''),group=template.get('group',''),label=template.get('label',''),commodity_ids=linked,state='未提交',revision=1)
+            section.update(editors=assignment_map.get(section['id'],[u['id']]),tags=[],type=template.get('type',''),group=template.get('group',''),label=template.get('label',''),commodity_ids=linked,state='未提交',revision=1)
         if layout=='free':
             index=0
             for section in doc['sections']:
@@ -529,6 +542,9 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
     if path in ['/api/save','/api/refresh']:return {'error':'新版协作报告请按章节保存，不能覆盖整篇文档'},400
     if path=='/api/check':return None
     if path=='/api/transition':
+        if d['action']=='提交' and m['collaboration']=='shared':
+            from report_writer import pending_sections
+            if pending_sections(s,r['id']):return {'error':'还有生成中或待确认的 AI 候选，请章节负责人处理后再发起审批'},400
         if d['action']=='提交' and m['collaboration']=='shared' and any(x.get('state')!='已提交' for x in json.loads(r.document)['sections']):return {'error':'多人报告须全部章节提交后才能发起审批'},400
         return None
     doc=json.loads(r.document);section=next((x for x in doc['sections'] if x['id']==d.get('section_id')),None)
@@ -565,6 +581,31 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         if r['author']!=u['id']:return {'error':'仅创建人可管理章节'},403
         if int(d['version'])!=r['version']:return {'error':'结构版本已更新，请刷新'},409
         action=d['action']
+        if action=='assign':
+            if m['collaboration']!='shared':raise ValueError('仅多人研报支持集中章节分工')
+            assignments=d.get('assignments')
+            if not isinstance(assignments,list) or not assignments or len(assignments)>30:raise ValueError('请选择要调整的章节')
+            current={x['id']:x for x in doc['sections']};seen=set();changes=[]
+            for item in assignments:
+                if not isinstance(item,dict):raise ValueError('章节分工格式无效')
+                sid=item.get('section_id');raw=item.get('editors')
+                if sid in seen or sid not in current:raise ValueError('章节不存在或重复')
+                seen.add(sid)
+                if not isinstance(raw,list) or not raw:raise ValueError('每章至少需要一位编辑人')
+                editors=list(dict.fromkeys(int(x) for x in raw))
+                if not set(editors)<=set([r['author']]+m['collaborators']):raise ValueError('编辑人必须为创建人或协作人')
+                for uid in editors:
+                    person=s.get(User,uid)
+                    if not person or not person.enabled or person.role not in ['admin','researcher']:raise ValueError('编辑人必须为启用的管理员或研究员')
+                target=current[sid]
+                if set(editors)==set(target.get('editors',[])):continue
+                if target.get('state')=='已提交':return {'error':'已提交章节须先撤销提交后再调整分工'},400
+                changes.append((target,editors))
+            if not changes:return {'ok':True,'version':r['version'],'changed':False},200
+            for target,editors in changes:
+                target['editors']=editors;target['revision']=target.get('revision',0)+1
+            return save_doc(s,r,u,doc,stamp,snapshot,event,'批量调整章节分工',
+                            '；'.join((target.get('title') or target['id'])+'：'+','.join(str(x) for x in editors) for target,editors in changes))
         if action=='add':
             if len(doc['sections'])>=30:raise ValueError('最多30章')
             doc['sections'].append({'id':e.uid(),'title':'新增章节','required':False,'blocks':[],'editors':[u['id']],'tags':[],'commodity_ids':[],'state':'编辑中','revision':1})
@@ -618,6 +659,9 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         if section['state']=='编辑中':section['state']='未提交'
         return save_doc(s,r,u,doc,stamp,snapshot,event,'刷新章节数据' if d.get('refresh') else '保存章节',sname)
     if path=='/api/chapter/submit':
+        if m['collaboration']=='shared':
+            from report_writer import pending_sections
+            if section['id'] in pending_sections(s,r['id']):return {'error':'本章还有待确认的 AI 候选，请负责人采用或放弃后再提交'},400
         if not any(b.get('text','').strip() or b.get('data') for b in section['blocks']):return {'error':'空章节不能提交'},400
         section['state']='已提交';section['revision']+=1
         return save_doc(s,r,u,doc,stamp,snapshot,event,'提交章节',sname)

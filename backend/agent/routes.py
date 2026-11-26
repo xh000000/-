@@ -141,7 +141,7 @@ def get_task(task_id: str, request: Request, session: Session = Depends(get_sess
 # ---------------------------------------------------------------------------
 # AI 日报流水线
 # ---------------------------------------------------------------------------
-@router.post('/pipeline/run', summary='触发 AI 日报流水线（后台生成初稿并送研究复核）')
+@router.post('/pipeline/run', summary='触发 AI 日报流水线（兼容旧客户端生成草稿，人工核对后送审）')
 async def post_pipeline(request: Request, session: Session = Depends(get_session)):
     user = _auth(request, session)
     if user['role'] not in ('admin', 'researcher'):

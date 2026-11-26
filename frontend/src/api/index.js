@@ -47,3 +47,14 @@ export async function del(path) {
 export const fileUrl = id => `/api/library/file/${id}`;
 export const downloadUrl = id => `/api/library/file/${id}?download=1`;
 export const printUrl = id => `/api/report-print/${id}`;
+
+/* ZIP Skill package inspection: raw bytes, authenticated session, no multipart dependency. */
+export async function inspectSkillZip(file) {
+  const response = await fetch('/api/report-ai/skills/inspect-zip', {
+    method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/zip' }, body: file,
+  });
+  let result;
+  try { result = await response.json(); } catch { throw new ApiError('服务返回了非 JSON 响应', response.status); }
+  if (!response.ok) throw new ApiError(result.error || 'ZIP 导入失败', response.status);
+  return result;
+}

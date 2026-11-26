@@ -12,3 +12,11 @@ langchain-openai==1.8.5
 langgraph==1.2.24
 langgraph-checkpoint-sqlite==3.1.3
 
+# 可选：DATABASE_URL 指向 PostgreSQL 时才需要（sqlite 部署可以不装）
+psycopg[binary]==3.2.10
+
+# 可选：DATABASE_URL 指向 MySQL 时才需要（腾讯云 CloudBase / TDSQL 等）
+PyMySQL==1.1.1
+
+# SKILL.md 安全解析（支持标准 YAML 多行描述）
+PyYAML==6.0.4

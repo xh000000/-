@@ -17,7 +17,7 @@
       <nav class="app-nav">
         <el-menu
           :default-active="route.path"
-          :default-openeds="opened"
+          :default-openeds="[]"
           background-color="#304156"
           text-color="#bfcbd9"
           active-text-color="#409EFF"
@@ -82,7 +82,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { MENU, breadcrumb, filterMenu } from '../utils/menu';
 import { ROLE_NAMES } from '../utils/format';
-import { isAdmin, logout, user, session } from '../store/session';
+import { logout, user, session } from '../store/session';
 import ChangePasswordDialog from '../components/ChangePasswordDialog.vue';
 import AccountMenu from '../components/AccountMenu.vue';
 import TabsBar from '../components/TabsBar.vue';
@@ -97,14 +97,7 @@ const crumbs = computed(() => breadcrumb(route.path));
 /* 全局显示开关叠加账号权限；系统设置及其全部子菜单仅管理员可见。 */
 const visibleMenu = computed(() => filterMenu(MENU, user.value, session.data?.menu_visibility || {}));
 
-/* 当前页所属分组默认展开，其余按手册的常用入口各展开一个。 */
-const opened = computed(() => {
-  const labels = ['g:研报管理'];
-  if (isAdmin.value) labels.push('g:系统设置', 'g:审批管理');
-  const current = visibleMenu.value.find(group => group.children?.some(child => child.path === route.path));
-  if (current && !labels.includes('g:' + current.label)) labels.push('g:' + current.label);
-  return labels;
-});
+/* 菜单分组默认收起，由用户按需点击展开。 */
 
 async function onLogout() {
   try {
