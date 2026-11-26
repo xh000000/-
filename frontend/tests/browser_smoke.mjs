@@ -31,7 +31,9 @@ const CANDIDATES = [
 
 const ROUTES = [
   ['/', '工作台'],
+  ['/agent', 'AI 问答'],
   ['/reports', '研报中心'],
+  ['/viewpoints', '观点库'],
   ['/approval', '审核中心'],
   ['/library/cloud', '云盘'],
   ['/library/docs', '文档管理库'],

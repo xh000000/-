@@ -52,6 +52,7 @@
     </el-aside>
 
     <el-container class="app-body">
+      <TabsBar />
       <el-header class="app-header" height="56px">
         <div class="crumb">
           <template v-for="(part, index) in crumbs" :key="part">
@@ -84,6 +85,7 @@ import { ROLE_NAMES } from '../utils/format';
 import { isAdmin, logout, user, session } from '../store/session';
 import ChangePasswordDialog from '../components/ChangePasswordDialog.vue';
 import AccountMenu from '../components/AccountMenu.vue';
+import TabsBar from '../components/TabsBar.vue';
 
 const route = useRoute();
 const router = useRouter();

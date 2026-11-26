@@ -3,7 +3,7 @@
 数据访问一律走 ORM：``s`` 是 SQLAlchemy Session，查询用 select()，写入用对象赋值。
 """
 import json,re,datetime
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 import db
 import report_engine as e
 from db import Author, Category, CategoryMigration, Commodity, ConfigEvent, Event, Report, User, Version
@@ -46,7 +46,108 @@ def migrate(s):
         db.set_flag(s,'manual-v1')
     seed_commodity_tree(s)
 
-# 《兴业期货日度策略》覆盖的期货品种：板块 →（品种, 合约代码），与合集「三、金融与商品基本面展望」下的 01～06 一一对应。
+# 品种字典：板块 →（品种, 合约代码, 交易所, 别名）。
+# 覆盖上期所（SHFE）、上期能源（INE）、大商所（DCE）、郑商所（CZCE）、
+# 广期所（GFEX）、中金所（CFFEX）当前全部挂牌品种；股指、国债是多合约并行的
+# 品种，合约代码用斜杠并列，仍按一个品种维护。别名用于指标名自动拆品种。
+EXCHANGES = {
+    'SHFE': '上期所', 'INE': '上期能源', 'DCE': '大商所',
+    'CZCE': '郑商所', 'GFEX': '广期所', 'CFFEX': '中金所',
+}
+
+COMMODITY_DICT = {
+    '金融衍生品': [
+        ('股指', 'IF/IH/IC/IM', 'CFFEX', ['沪深300', '上证50', '中证500', '中证1000', '股指期货']),
+        ('国债', 'T/TF/TS/TL', 'CFFEX', ['国债期货', '十年国债', '国开债']),
+        ('集运指数', 'EC', 'INE', ['集运欧线', '欧线', 'SCFIS', '集运指数欧线']),
+    ],
+    '贵金属': [
+        ('黄金', 'AU', 'SHFE', ['沪金', '伦敦金', '金价']),
+        ('白银', 'AG', 'SHFE', ['沪银', '银价', '伦敦银']),
+    ],
+    '有色与新能源': [
+        ('铜', 'CU', 'SHFE', ['沪铜', '电解铜', '阴极铜', '铜精矿']),
+        ('国际铜', 'BC', 'INE', ['国际铜', '保税铜']),
+        ('铝', 'AL', 'SHFE', ['沪铝', '电解铝', '铝锭']),
+        ('氧化铝', 'AO', 'SHFE', ['氧化铝粉', '氧化铝']),
+        ('铸造铝合金', 'AD', 'SHFE', ['铝合金', '铸造铝合金', '铝硅合金']),
+        ('锌', 'ZN', 'SHFE', ['沪锌', '锌锭']),
+        ('铅', 'PB', 'SHFE', ['沪铅', '铅锭']),
+        ('镍', 'NI', 'SHFE', ['沪镍', '电解镍', '镍板', '镍铁']),
+        ('锡', 'SN', 'SHFE', ['沪锡', '锡锭']),
+        ('工业硅', 'SI', 'GFEX', ['金属硅', '工业硅']),
+        ('多晶硅', 'PS', 'GFEX', ['多晶硅', '硅料']),
+        ('碳酸锂', 'LC', 'GFEX', ['锂', '电池级碳酸锂', '锂盐']),
+    ],
+    '黑色建材': [
+        ('螺纹钢', 'RB', 'SHFE', ['螺纹', '螺纹钢', '建筑钢材']),
+        ('热卷', 'HC', 'SHFE', ['热轧卷板', '热轧板卷', '热轧']),
+        ('线材', 'WR', 'SHFE', ['高线', '盘条']),
+        ('不锈钢', 'SS', 'SHFE', ['不锈钢', '300系']),
+        ('铁矿石', 'I', 'DCE', ['铁矿', '普氏指数', '铁矿石']),
+        ('焦煤', 'JM', 'DCE', ['炼焦煤', '主焦煤', '焦煤']),
+        ('焦炭', 'J', 'DCE', ['冶金焦', '焦炭']),
+        ('硅铁', 'SF', 'CZCE', ['硅铁', '75硅铁']),
+        ('锰硅', 'SM', 'CZCE', ['硅锰', '锰硅合金']),
+        ('玻璃', 'FG', 'CZCE', ['浮法玻璃', '玻璃']),
+        ('纯碱', 'SA', 'CZCE', ['重碱', '轻碱', '纯碱']),
+    ],
+    '能源化工': [
+        ('原油', 'SC', 'INE', ['国际原油', '布伦特', 'WTI', '原油']),
+        ('燃料油', 'FU', 'SHFE', ['高硫燃料油', '燃料油']),
+        ('低硫燃料油', 'LU', 'INE', ['低硫燃油', '低硫燃料油']),
+        ('石油沥青', 'BU', 'SHFE', ['沥青', '石油沥青']),
+        ('液化石油气', 'PG', 'DCE', ['LPG', '液化气', '丙烷']),
+        ('动力煤', 'ZC', 'CZCE', ['郑煤', '动力煤', '电煤']),
+        ('甲醇', 'MA', 'CZCE', ['甲醇', '木精']),
+        ('PTA', 'TA', 'CZCE', ['精对苯二甲酸', 'PTA']),
+        ('乙二醇', 'EG', 'DCE', ['乙二醇', 'MEG']),
+        ('对二甲苯', 'PX', 'CZCE', ['PX', '对二甲苯']),
+        ('瓶片', 'PR', 'CZCE', ['聚酯瓶片', '瓶片']),
+        ('短纤', 'PF', 'CZCE', ['涤纶短纤', '短纤']),
+        ('丙烯', 'PL', 'CZCE', ['丙烯', '丙烷脱氢']),
+        ('聚乙烯', 'L', 'DCE', ['塑料', '线性低密度聚乙烯', 'LLDPE']),
+        ('PVC', 'V', 'DCE', ['聚氯乙烯', 'PVC', '电石法']),
+        ('聚丙烯', 'PP', 'DCE', ['聚丙烯', 'PP', '拉丝']),
+        ('苯乙烯', 'EB', 'DCE', ['苯乙烯', 'EB']),
+        ('纯苯', 'BZ', 'DCE', ['纯苯', '石油苯']),
+        ('烧碱', 'SH', 'CZCE', ['液碱', '片碱', '烧碱']),
+        ('尿素', 'UR', 'CZCE', ['尿素', '小颗粒尿素']),
+        ('天然橡胶', 'RU', 'SHFE', ['沪胶', '全乳胶', '天然橡胶']),
+        ('20号胶', 'NR', 'INE', ['标胶', '20号胶']),
+        ('丁二烯橡胶', 'BR', 'SHFE', ['顺丁橡胶', '合成橡胶', '丁二烯橡胶']),
+    ],
+    '农产品': [
+        ('豆一', 'A', 'DCE', ['黄大豆1号', '国产大豆', '豆一']),
+        ('豆二', 'B', 'DCE', ['黄大豆2号', '进口大豆', '豆二']),
+        ('豆粕', 'M', 'DCE', ['豆粕', '豆粕现货']),
+        ('豆油', 'Y', 'DCE', ['豆油', '一级豆油']),
+        ('棕榈油', 'P', 'DCE', ['棕榈油', '棕油', '24度棕榈油']),
+        ('菜籽油', 'OI', 'CZCE', ['菜油', '四级菜油']),
+        ('菜籽粕', 'RM', 'CZCE', ['菜粕', '菜籽粕']),
+        ('玉米', 'C', 'DCE', ['玉米', '黄玉米']),
+        ('玉米淀粉', 'CS', 'DCE', ['淀粉', '玉米淀粉']),
+        ('鸡蛋', 'JD', 'DCE', ['鸡蛋', '蛋价']),
+        ('生猪', 'LH', 'DCE', ['生猪', '猪价', '毛猪']),
+        ('粳米', 'RR', 'DCE', ['粳米', '大米']),
+        ('棉花', 'CF', 'CZCE', ['郑棉', '棉花', '3128B']),
+        ('棉纱', 'CY', 'CZCE', ['棉纱', 'C32S']),
+        ('白糖', 'SR', 'CZCE', ['郑糖', '食糖', '白糖']),
+        ('苹果', 'AP', 'CZCE', ['苹果', '红富士']),
+        ('红枣', 'CJ', 'CZCE', ['红枣', '灰枣']),
+        ('花生', 'PK', 'CZCE', ['花生', '花生仁']),
+        ('早籼稻', 'RI', 'CZCE', ['早稻', '早籼稻']),
+        ('强麦', 'WH', 'CZCE', ['强筋小麦', '强麦']),
+        ('普麦', 'PM', 'CZCE', ['普通小麦', '普麦']),
+        ('纤维板', 'FB', 'DCE', ['纤维板', '中纤板']),
+        ('胶合板', 'BB', 'DCE', ['胶合板', '细木工板']),
+        ('纸浆', 'SP', 'SHFE', ['木浆', '针叶浆', '阔叶浆']),
+        ('原木', 'LG', 'DCE', ['原木', '辐射松']),
+    ],
+}
+
+# 日度策略六个板块引用的品种（v1 迁移用），与《日度策略》正文 01～06 章节一一对应。
+# 刻意保持 17 个，不跟随品种字典扩张——报告章节的默认关联是编辑口径，不是全市场清单。
 COMMODITY_TREE = {
     '金融衍生品': [('股指', 'IF/IH/IC/IM'), ('国债', 'T/TF/TS/TL')],
     '贵金属': [('黄金', 'AU'), ('白银', 'AG')],
@@ -64,35 +165,74 @@ def _commodity(s,name):
 def seed_commodity_tree(s):
     """把品种库补成「板块 → 期货品种（含合约代码）」，并把日度策略各章节的关联品种对上。幂等。"""
     add_columns(s,'commodities',{'code':"TEXT DEFAULT ''"})
-    if db.has_flag(s,'commodity-tree-v1'):
+    if not db.has_flag(s,'commodity-tree-v1'):
+        sectors = {}
+        for sector, items in COMMODITY_TREE.items():
+            row = _commodity(s,sector)
+            if row:
+                row.parent_id=None;row.enabled=1
+                sid = row.id
+            else:
+                node=Commodity(name=sector,parent_id=None,enabled=1)
+                s.add(node);s.flush();sid = node.id
+            ids = []
+            for name, code in items:
+                row = _commodity(s,name)
+                if row:
+                    row.parent_id=sid;row.code=code;row.enabled=1
+                    ids.append(row.id)
+                else:
+                    node=Commodity(name=name,parent_id=sid,code=code,enabled=1)
+                    s.add(node);s.flush();ids.append(node.id)
+            sectors[sector] = ids
+        names = [name for items in COMMODITY_TREE.values() for name, _ in items]
+        for cat,cfg in e._daily_categories(s):
+            for section in cfg.get('sections', []):
+                section['commodity_ids'] = list(sectors[section['title']]) if section.get('title') in sectors else []
+            cfg['commodities'] = ['综合'] + names
+            cat.config=e.dump(cfg);cat.revision=(cat.revision or 1)+1
+            s.add(ConfigEvent(category_id=cat.id,actor='系统升级',config=e.dump({'name':cat.name,'config':cfg,'enabled':True}),revision=cat.revision,at=e.now_utc()))
+        db.set_flag(s,'commodity-tree-v1')
+    seed_commodity_dict(s)
+
+
+def seed_commodity_dict(s):
+    """把品种库补成完整的行业字典：板块 → 品种（合约代码 + 交易所 + 别名 + 排序）。
+
+    与 v1 的区别：v1 只保证日度策略覆盖的 17 个品种存在，v2 补齐六大交易所当前
+    挂牌的全部品种，并给每条记录补上交易所、别名与板块内排序。已有记录只补空
+    字段，不覆盖人工改过的名称、代码、板块与启用状态——删掉的品种也不会被复活。
+    """
+    add_columns(s,'commodities',{'exchange':"TEXT DEFAULT ''",
+                                 'aliases':"TEXT DEFAULT ''",
+                                 'position':'INTEGER DEFAULT 0'})
+    # 合约代码是品种的业务主键：非空即唯一（板块不占编码，用部分索引排除空值）
+    s.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_commodities_code "
+                   "ON commodities(code) WHERE code IS NOT NULL AND code <> ''"))
+    if db.has_flag(s,'commodity-dict-v2'):
         return
-    sectors = {}
-    for sector, items in COMMODITY_TREE.items():
-        row = _commodity(s,sector)
+    for s_index, (sector, items) in enumerate(COMMODITY_DICT.items(), 1):
+        row = _commodity(s, sector)
         if row:
-            row.parent_id=None;row.enabled=1
+            row.parent_id=None;row.position=s_index
+            if row.enabled is None:row.enabled=1
             sid = row.id
         else:
-            node=Commodity(name=sector,parent_id=None,enabled=1)
+            node=Commodity(name=sector,parent_id=None,enabled=1,position=s_index)
             s.add(node);s.flush();sid = node.id
-        ids = []
-        for name, code in items:
-            row = _commodity(s,name)
+        for i_index, (name, code, exchange, aliases) in enumerate(items, 1):
+            row = _commodity(s, name)
             if row:
-                row.parent_id=sid;row.code=code;row.enabled=1
-                ids.append(row.id)
+                if row.parent_id is None:row.parent_id=sid
+                if not (row.code or '').strip():row.code=code
+                if not (row.exchange or '').strip():row.exchange=exchange
+                if not (row.aliases or '').strip():row.aliases=e.dump(aliases)
+                row.position=i_index
             else:
-                node=Commodity(name=name,parent_id=sid,code=code,enabled=1)
-                s.add(node);s.flush();ids.append(node.id)
-        sectors[sector] = ids
-    names = [name for items in COMMODITY_TREE.values() for name, _ in items]
-    for cat,cfg in e._daily_categories(s):
-        for section in cfg.get('sections', []):
-            section['commodity_ids'] = list(sectors[section['title']]) if section.get('title') in sectors else []
-        cfg['commodities'] = ['综合'] + names
-        cat.config=e.dump(cfg);cat.revision=(cat.revision or 1)+1
-        s.add(ConfigEvent(category_id=cat.id,actor='系统升级',config=e.dump({'name':cat.name,'config':cfg,'enabled':True}),revision=cat.revision,at=e.now_utc()))
-    db.set_flag(s,'commodity-tree-v1')
+                s.add(Commodity(name=name,parent_id=sid,code=code,exchange=exchange,
+                                aliases=e.dump(aliases),enabled=1,position=i_index))
+                s.flush()
+    db.set_flag(s,'commodity-dict-v2')
 
 
 def tree(s):
@@ -108,6 +248,46 @@ def tree(s):
 
 def catalogs(s):
     return {'category_tree':tree(s),'authors':[x.to_dict() for x in s.execute(select(Author).order_by(Author.id)).scalars()],'commodities':[x.to_dict() for x in s.execute(select(Commodity).order_by(Commodity.id)).scalars()],'members':[dict(r._mapping) for r in s.execute(select(User.id,User.name,User.role,User.enabled).order_by(User.id))]}
+
+
+def commodity_usage(s,cid):
+    """统计有多少份报告在当前章节配置里引用了这个品种。
+
+    章节的 ``commodity_ids`` 存在报告快照的 JSON 里，没有外键，只能逐份解析；
+    报告量在千级以内，扫一遍比维护一张关联表更省事，也不会出现两份真相。
+    """
+    count=0
+    for (raw,) in s.execute(select(Report.config_snapshot)):
+        try:
+            config=json.loads(raw or '{}')
+        except Exception:
+            continue
+        if any(int(cid) in [int(x) for x in (section or {}).get('commodity_ids') or []
+                            if str(x).lstrip('-').isdigit()]
+               for section in config.get('sections') or []):
+            count+=1
+    return count
+
+
+def delete_commodity(s,cid):
+    """删除品种。子品种与已被报告引用的品种都不允许删，避免留下指向空处的章节配置。"""
+    row=s.get(Commodity,cid)
+    if not row:
+        raise ValueError('品种不存在')
+    children=s.execute(select(Commodity.name).where(Commodity.parent_id==cid)).scalars().all()
+    if children:
+        raise ValueError('「%s」下还有 %d 个品种（%s），请先删除或移出子品种'
+                         % (row.name,len(children),'、'.join(children[:3])))
+    used=commodity_usage(s,cid)
+    if used:
+        raise ValueError('「%s」已被 %d 份报告的章节引用，不能删除；如不再使用请改为停用'
+                         % (row.name,used))
+    name=row.name
+    s.delete(row)
+    # 指标上的品种是文本冗余列，品种删掉后它就成了指向空处的名字，一并清空
+    s.execute(update(db.DimIndicator).where(db.DimIndicator.commodity==name).values(commodity=''))
+    s.flush()
+    return {'ok':True,'id':cid,'name':name}
 
 def meta(r):return json.loads(r['metadata']) if r['metadata'] else None
 def editable(r):return r['status'] in ['草稿','已退回']
@@ -175,6 +355,12 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
     if path in ['/api/catalog','/api/category-tree']:
         if u['role']!='admin':return {'error':'仅管理员可管理基础资料'},403
         if path=='/api/catalog':
+            if str(d.get('action') or '')=='delete':
+                if d.get('kind')!='commodities':raise ValueError('该资料类型不支持删除')
+                try:rid=int(d.get('id') or 0)
+                except (TypeError,ValueError):raise ValueError('缺少要删除的品种')
+                if not rid:raise ValueError('缺少要删除的品种')
+                return delete_commodity(s,rid),200
             kind=d['kind'];name=e.text(d['name'],80).strip();enabled=int(bool(d.get('enabled',True)));rid=int(d['id']) if d.get('id') else None
             if not name or kind not in ['authors','commodities']:raise ValueError('资料类型或名称无效')
             if kind=='authors':
@@ -196,13 +382,37 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
                     if not p or p.parent_id or parent==rid:raise ValueError('品种仅支持两级分类')
                     if rid and s.execute(select(Commodity.id).where(Commodity.parent_id==rid).limit(1)).first():raise ValueError('有子品种的分类不能移为二级')
                 code=e.text(d.get('code',''),40).strip().upper()
-                if code and not re.fullmatch(r'[A-Z0-9/,\-]{1,40}',code):raise ValueError('合约代码只能用字母、数字与斜杠')
+                if parent:
+                    # 品种以合约为唯一标识：必须填、全局唯一；板块不占编码
+                    if not code:raise ValueError('请填写合约代码：品种以合约代码作为唯一标识')
+                    if not re.fullmatch(r'[A-Z0-9/,\-]{1,40}',code):raise ValueError('合约代码只能用字母、数字与斜杠')
+                    taken=s.execute(select(Commodity.name).where(Commodity.code==code,
+                                                                 Commodity.id!=(rid or 0))).scalars().first()
+                    if taken:raise ValueError('合约代码 %s 已被「%s」占用，请换一个'%(code,taken))
+                else:
+                    code=''
+                exchange=e.text(d.get('exchange',''),10).strip().upper()
+                if exchange and exchange not in EXCHANGES:raise ValueError('交易所只能填 SHFE / INE / DCE / CZCE / GFEX / CFFEX')
+                aliases=d.get('aliases') or []
+                if isinstance(aliases,str):
+                    text_aliases=aliases.strip()
+                    if text_aliases.startswith('['):
+                        try:aliases=json.loads(text_aliases)
+                        except ValueError:raise ValueError('别名格式不正确')
+                    else:aliases=re.split(r'[,，\s]+',text_aliases)
+                if not isinstance(aliases,list):raise ValueError('别名格式不正确')
+                aliases=list(dict.fromkeys(e.text(x,20).strip() for x in aliases if e.text(x,20).strip()))[:12]
+                aliases_text=e.dump(aliases) if aliases else ''
                 if rid:
                     row=s.get(Commodity,rid)
                     if not row:raise ValueError('品种不存在')
                     row.name=name;row.parent_id=parent;row.code=code;row.enabled=enabled
+                    row.exchange=exchange if parent else ''
+                    row.aliases=aliases_text if parent else ''
                 else:
-                    row=Commodity(name=name,parent_id=parent,code=code,enabled=enabled)
+                    row=Commodity(name=name,parent_id=parent,code=code,enabled=enabled,
+                                  exchange=exchange if parent else '',
+                                  aliases=aliases_text if parent else '')
                     s.add(row);s.flush();rid=row.id
             return {'id':rid},200
         label=e.text(d['label'],80).strip();parent=int(d['parent_id']) if d.get('parent_id') else None;rid=int(d['id']) if d.get('id') else None;nodes={n['id']:n for n in tree(s)}

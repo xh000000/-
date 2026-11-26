@@ -27,6 +27,22 @@ export async function api(path, data) {
   return body;
 }
 
+/* DELETE 请求（Agent 线程删除等）。 */
+export async function del(path) {
+  const res = await fetch('/api/' + path, { method: 'DELETE', credentials: 'same-origin' });
+  const text = await res.text();
+  let body = {};
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = { error: '服务返回了非 JSON 响应' };
+    }
+  }
+  if (!res.ok) throw new ApiError(body.error || `请求失败（${res.status}）`, res.status);
+  return body;
+}
+
 /* 二进制下载（打包 zip、原始文件、打印页）走浏览器直连，不经过 fetch。 */
 export const fileUrl = id => `/api/library/file/${id}`;
 export const downloadUrl = id => `/api/library/file/${id}?download=1`;

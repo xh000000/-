@@ -10,13 +10,10 @@
       <el-button :loading="loading" @click="load">刷新</el-button>
     </PageHead>
 
-    <div class="entry-summary">
-      <div><span>数据源</span><strong>{{ sources.length }}<small>个</small></strong><p>统一管理数据接入通道</p></div>
-      <div><span>已启用</span><strong>{{ sources.filter(item => item.enabled).length }}<small>个</small></strong><p>当前可用的数据来源</p></div>
-      <div><span>累计数据点</span><strong>{{ sources.reduce((sum, item) => sum + Number(item.rows || 0), 0).toLocaleString() }}</strong><p>已同步入库的数据记录</p></div>
-      <div><span>同步配置</span><strong>{{ configs.length }}<small>项</small></strong><p>接口与自动执行计划</p></div>
+    <div class="entry-section-head">
+      <div><h3>数据源管理</h3><p class="caption">每个数据源一张卡：状态、巡检健康（近 30 天成功率）、数据规模与同步入口</p></div>
+      <span class="hint entry-meta">{{ sources.filter(item => item.enabled).length }}/{{ sources.length }} 启用 · {{ configs.length }} 项同步配置 · 累计 {{ totalRows.toLocaleString() }} 数据点</span>
     </div>
-    <div class="entry-section-head"><div><h3>数据源管理</h3><p class="caption">先添加数据源，再配置接口与同步计划</p></div><el-tag effect="plain">{{ sources.length }} 个数据源</el-tag></div>
     <div class="card-grid src-grid">
       <div v-for="source in sources" :key="source.key" class="panel src-card" :class="{ 'source-clickable': canConfig }" @click="canConfig && openSourceSettings(source)">
         <button v-if="canConfig" class="source-config-link" type="button" @click.stop="openSourceSettings(source)" :aria-label="`配置${source.name}`">查看配置 →</button>
@@ -32,10 +29,19 @@
             </el-tag>
           </div>
         </div>
+        <div v-if="healthOf(source)" class="src-health" :class="'health-' + healthOf(source).level">
+          <span class="health-dot" :class="'dot-' + healthOf(source).level" />
+          <span>成功率 <b>{{ healthOf(source).success_rate === null ? '—' : healthOf(source).success_rate + '%' }}</b></span>
+          <span>{{ healthOf(source).jobs_30d ? `近30天 ${healthOf(source).jobs_30d} 次` : '近期无作业' }}</span>
+          <span v-if="healthOf(source).bad_configs > 0" class="stale-warn">异常配置 {{ healthOf(source).bad_configs }}</span>
+        </div>
         <div class="src-facts">
           <span>数据点 <b>{{ source.rows }}</b></span>
           <span>指标 <b>{{ source.indicators }}</b></span>
           <span>最新 <b>{{ source.latest || '—' }}</b></span>
+          <span v-if="source.stale_days !== null && source.stale_days !== undefined" class="stale-tag" :class="{ 'stale-warn': source.stale_days > 3 }">
+            滞后 {{ source.stale_days }} 天
+          </span>
         </div>
         <p class="caption src-channel">{{ source.channel || '未填写取数通道说明' }}</p>
         <div class="source-actions">
@@ -97,9 +103,14 @@
         <el-table-column label="区间" width="82">
           <template #default="{ row }">近 {{ row.scope?.days || '—' }} 日</template>
         </el-table-column>
-        <el-table-column label="状态" width="86">
+        <el-table-column label="状态" width="104">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)" size="small" disable-transitions>{{ row.status }}</el-tag>
+            <el-tooltip v-if="row.reason_type" :content="'失败类别：' + row.reason_type + '，点击说明查看排查建议'" placement="top">
+              <el-tag type="danger" size="small" effect="plain" style="margin-left: 4px" disable-transitions>
+                {{ row.reason_type.slice(0, 2) }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="数据点" width="80" align="right">
@@ -141,6 +152,7 @@
           <el-button type="primary" size="small" @click="openConfig(null, settingsSource)">新建配置</el-button>
         </div>
       </div>
+      <el-alert v-if="!sourceConfigs.length" type="info" :closable="false" style="margin-bottom: 14px" :title="configEmptyHint" />
       <el-table :data="sourceConfigs" empty-text="还没有取数配置" size="small">
         <el-table-column prop="name" label="名称" min-width="150">
           <template #default="{ row }">
@@ -268,19 +280,26 @@
         <el-form-item label="通道说明">
           <el-input v-model="sourceForm.channel" maxlength="120" placeholder="这条通道怎么取数，给同事看的" />
         </el-form-item>
-        <el-form-item label="可选范围">
+        <el-form-item label="同步候选">
           <el-radio-group v-model="sourceForm.scope_mode">
-            <el-radio-button label="commodity">按品种库</el-radio-button>
-            <el-radio-button label="custom">自定义项</el-radio-button>
+            <el-radio-button label="commodity">用品种库</el-radio-button>
+            <el-radio-button label="custom">自定义清单</el-radio-button>
           </el-radio-group>
+          <el-button v-if="canConfig" text type="primary" size="small" style="margin-left: 8px" @click="router.push('/system/scope-library')">指标管理</el-button>
         </el-form-item>
-        <el-form-item v-if="sourceForm.scope_mode === 'custom'" label="自定义项">
-          <el-input
-            v-model="sourceForm.scope_text"
-            type="textarea"
-            :rows="4"
-            placeholder="每行一个，如：南华商品指数 / 螺纹钢现货价"
-          />
+        <el-form-item v-if="sourceForm.scope_mode === 'custom'" label="候选清单">
+          <el-select
+            v-model="sourceForm.scope_list"
+            multiple filterable allow-create default-first-option
+            :reserve-keyword="false"
+            :loading="!scopeLibrary.length"
+            placeholder="从常用指标里勾选，也可输入新增后回车"
+            style="width: 100%"
+          >
+            <el-option-group v-for="group in scopeLibrary" :key="group.group" :label="group.group">
+              <el-option v-for="item in group.items" :key="item" :label="item" :value="item" />
+            </el-option-group>
+          </el-select>
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="sourceForm.enabled" />
@@ -322,6 +341,12 @@
           </el-select>
         </el-form-item>
         <el-alert v-if="configForm.kind === 'eastmoney_snapshot'" type="info" :closable="false" title="最新行情快照：每次同步更新行情当天的数据，不提供历史日线或收盘价。" style="margin-bottom: 16px" />
+        <el-alert v-if="configForm.kind === 'windpy'" type="info" :closable="false" style="margin-bottom: 16px"
+          title="WindPy 本机终端：需本机装有已登录的 Wind 金融终端（MAC 绑定账号），凭据留在终端侧。范围条目填「指标名|Wind代码|通道」，如：螺纹钢主连|RBZL.SHF|wsd；南华商品指数|M002122626|edb。接口地址可不填。" />
+        <el-alert v-if="configForm.kind === 'ifind_http'" type="info" :closable="false" style="margin-bottom: 16px"
+          title="iFinD HTTP：默认取 ft.10jqka.com.cn（也可填 quantapi.51ifind.com）。密钥填 refresh_token（超级命令客户端「工具-refresh_token 查询」获取）。注意跨品种单位不同：原油是 元/桶、白银是 元/千克，与默认 元/吨 不符时在「高级-单位」里覆盖。" />
+        <el-alert v-if="configForm.kind === 'generic_json'" type="info" :closable="false" style="margin-bottom: 16px"
+          title="通用 JSON 接口：适合 SMM 等自有账号的 API。把接口地址、token（放 headers 或密钥）配好，用「高级」设置响应路径与字段映射。" />
         <el-form-item label="取数方式">
           <el-select v-model="configForm.kind" style="width: 100%">
             <el-option v-for="item in kinds" :key="item.key" :label="item.label" :value="item.key" />
@@ -444,6 +469,9 @@
         <div class="job-detail-row"><span>来源</span><b>{{ activeJob.source_name }}</b></div>
         <div class="job-detail-row"><span>状态</span>
           <el-tag :type="statusType(activeJob.status)" size="small" disable-transitions>{{ activeJob.status }}</el-tag>
+          <el-tag v-if="activeJob.reason_type" type="danger" size="small" effect="plain" style="margin-left: 6px" disable-transitions>
+            {{ activeJob.reason_type }}
+          </el-tag>
         </div>
         <div class="job-detail-row"><span>范围</span><b>{{ scopeText(activeJob) }}</b></div>
         <div class="job-detail-row"><span>区间</span><b>近 {{ activeJob.scope?.days || '—' }} 个交易日</b></div>
@@ -457,6 +485,12 @@
         <div class="job-detail-row"><span>完成</span><b>{{ localTime(activeJob.finished_at) }}</b></div>
         <p class="caption" style="margin-top: 10px">说明</p>
         <p class="job-detail-note">{{ activeJob.message || '—' }}</p>
+        <template v-if="activeJob.reason_type">
+          <p class="caption" style="margin-top: 10px">排查建议（{{ activeJob.reason_type }}）</p>
+          <ol class="troubleshoot-list">
+            <li v-for="(step, index) in activeJob.troubleshooting || []" :key="index">{{ step }}</li>
+          </ol>
+        </template>
       </div>
     </el-dialog>
   </div>
@@ -465,29 +499,49 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
+import { useRouter } from 'vue-router';
 import PageHead from '../components/PageHead.vue';
 import { api } from '../api';
 import { commodities, refresh } from '../store/session';
 import { localTime } from '../utils/format';
 
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+const router = useRouter();
 
 const sources = ref([]);
+const health = ref([]);
 const sourceSettingsVisible = ref(false);
 const settingsSource = ref(null);
 const sourceConfigs = computed(() => configs.value.filter(item => item.source === settingsSource.value?.key));
+// 空配置说明：不同来源的取数通道不同，缺 HTTP 配置不等于漏配
+const configEmptyHint = computed(() => {
+  const key = settingsSource.value?.key || '';
+  if (['wind', 'ifind', 'smm'].includes(key)) {
+    return '该数据源通过 WorkBuddy 连接器取数，凭据由连接器托管、平台不代持，因此没有 HTTP 取数配置。同步数据请回到数据源卡片点「登记同步」。';
+  }
+  if (['mysteel', 'longzhong'].includes(key)) {
+    return '该数据商没有公开 HTTP 接口，数据走「终端账号导出 → 导入 CSV」入库，因此没有取数配置。后续如搭建采集中间服务，可再新建配置接入。';
+  }
+  return '还没有取数配置。点「新建配置」填入接口地址与凭据即可。';
+});
 function sourceStatus(source) {
   if (!source.enabled) return { label: '已停用', type: 'info' };
   const related = configs.value.filter(item => item.source === source.key);
   if (related.some(item => item.last_status === '失败')) return { label: '同步失败', type: 'danger' };
   return { label: source.rows ? '已同步' : '待同步', type: source.rows ? 'success' : 'info' };
 }
+const healthByKey = computed(() => Object.fromEntries(health.value.map(item => [item.key, item])));
+function healthOf(source) {
+  return healthByKey.value[source.key];
+}
+const totalRows = computed(() => sources.value.reduce((sum, item) => sum + Number(item.rows || 0), 0));
 function openSourceSettings(source) {
   settingsSource.value = source;
   sourceSettingsVisible.value = true;
 }
 const metrics = ref([]);
 const kinds = ref([]);
+const scopeLibrary = ref([]);
 const freqs = ref([]);
 const configs = ref([]);
 const canSync = ref(false);
@@ -524,8 +578,23 @@ const sourceVisible = ref(false);
 const sourceSaving = ref(false);
 const sourceForm = reactive({
   id: null, key: '', name: '', product: '', channel: '',
-  scope_mode: 'commodity', scope_text: '', enabled: true,
+  scope_mode: 'commodity', scope_list: [], enabled: true,
 });
+// 候选项规范：只允许中文、字母、数字与 | . - _ / % ( ) 等，防止把备注或乱码当品种存进清单
+const SCOPE_ITEM_RE = /^[\w\u4e00-\u9fa5|.\-/%()（）·、]+$/;
+function normalizeScopeItems(raw) {
+  const items = [];
+  for (let item of raw) {
+    item = String(item).trim().slice(0, 60);
+    if (!item) continue;
+    if (!SCOPE_ITEM_RE.test(item)) {
+      throw new Error(`候选项含不支持的字符：${item}（只允许中文、字母、数字与 | . - _ / % ( ) 等）`);
+    }
+    if (!items.includes(item)) items.push(item);
+  }
+  if (items.length > 60) throw new Error('候选项最多 60 个');
+  return items;
+}
 
 const configVisible = ref(false);
 const configSaving = ref(false);
@@ -615,8 +684,11 @@ async function load() {
   try {
     const result = await api('data/sources');
     sources.value = result.sources || [];
+    health.value = result.health || [];
     metrics.value = result.metrics || [];
     kinds.value = result.kinds || [];
+    /* 候选清单不展示系统兜底的「未分组」：那一组装的是同步时自动落地的指标名，不是精心维护的候选 */
+    scopeLibrary.value = (result.scope_library || []).filter(group => !group.builtin);
     freqs.value = result.freqs || [];
     configs.value = result.configs || [];
     canSync.value = Boolean(result.can_sync);
@@ -748,14 +820,23 @@ function openSource(source) {
     product: source?.product || '',
     channel: source?.channel || '',
     scope_mode: source?.scope_mode || 'commodity',
-    scope_text: (source?.scope_items || []).join('\n'),
+    scope_list: [...(source?.scope_items || [])],
     enabled: source ? Boolean(source.enabled) : true,
   });
   sourceVisible.value = true;
 }
 
 async function saveSource() {
-  const items = sourceForm.scope_text.split('\n').map(x => x.trim()).filter(Boolean);
+  let items = [];
+  if (sourceForm.scope_mode === 'custom') {
+    try {
+      items = normalizeScopeItems(sourceForm.scope_list);
+    } catch (error) {
+      ElMessage.error(error.message);
+      return;
+    }
+  }
+  const creating = !sourceForm.id;
   sourceSaving.value = true;
   try {
     await api('data/sources', {
@@ -769,6 +850,21 @@ async function saveSource() {
     sourceVisible.value = false;
     await load();
     ElMessage.success('数据来源已保存');
+    if (creating) {
+      // 一步到底：新建完直接衔接取数配置；连接器/CSV 类来源可以跳过
+      const key = sourceForm.key;
+      const connectorLike = ['wind', 'ifind', 'smm', 'mysteel', 'longzhong'].includes(key);
+      try {
+        await ElMessageBox.confirm(
+          connectorLike
+            ? '数据源已创建。该来源可走连接器或 CSV 导入，不建取数配置也能用；若要直连 HTTP 接口，可现在新建配置。'
+            : '数据源已创建。要让它真正取数，还需一条取数配置（接口地址、凭据、范围与执行计划），现在就建吗？',
+          '下一步：取数配置',
+          { confirmButtonText: '新建配置', cancelButtonText: '先不用', type: 'info' },
+        );
+        openConfig(null, sources.value.find(item => item.key === key) || { key, name: sourceForm.name });
+      } catch { /* 用户选择跳过 */ }
+    }
   } catch (error) {
     ElMessage.error(error.message || '保存数据来源失败');
   } finally {
@@ -990,14 +1086,9 @@ onMounted(load);
 <style scoped>
 .sync-records-dialog { max-width: calc(100vw - 32px); }
 .data-entry-page { --entry-border: #e6ebf2; }
-.entry-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 28px; }
-.entry-summary > div { padding: 20px 22px; border: 1px solid var(--entry-border); border-radius: 12px; background: linear-gradient(135deg, #fff, #f8faff); }
-.entry-summary span { font-size: 13px; color: #64748b; }
-.entry-summary strong { display: block; margin: 10px 0 8px; font-size: 30px; line-height: 1.2; color: #183153; font-variant-numeric: tabular-nums; }
-.entry-summary small { margin-left: 7px; font-size: 13px; font-weight: 400; color: #94a3b8; }
-.entry-summary p { margin: 0; color: #94a3b8; font-size: 12px; }
 .entry-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .entry-section-head h3 { margin: 0 0 6px; font-size: 16px; }
+.entry-meta { white-space: nowrap; }
 .src-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; margin-bottom: 28px; }
 .src-card { border: 1px solid var(--entry-border); border-radius: 12px; padding: 20px; transition: box-shadow .2s, border-color .2s; }
 .source-clickable { cursor: pointer; }
@@ -1006,6 +1097,11 @@ onMounted(load);
 .src-card:hover { border-color: #b9cdee; box-shadow: 0 6px 22px #1831530a; }
 .source-identity { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .source-avatar { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: #3265b0; background: #edf3ff; font-size: 16px; font-weight: 600; }
+.src-health { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; padding: 7px 12px; border-radius: 8px; background: #f8fafc; color: #64748b; font-size: 12px; }
+.src-health b { color: #1f2937; font-weight: 600; }
+.src-health.health-红 { background: #fdf1f1; }
+.src-health.health-黄 { background: #fdf6ec; }
+.src-health.health-绿 { background: #f0f9f4; }
 .src-facts { display: grid; grid-template-columns: 1fr 1fr; padding: 14px 0; margin: 8px 0; border-top: 1px solid #f0f3f8; border-bottom: 1px solid #f0f3f8; }
 .src-facts span:last-child { grid-column: 1 / -1; }
 .source-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
@@ -1021,6 +1117,16 @@ onMounted(load);
 :deep(.el-table .el-table__cell) { padding-top: 13px; padding-bottom: 13px; }
 :deep(.page-head) { align-items: flex-start; gap: 20px; margin-bottom: 24px; }
 :deep(.page-head > .row) { flex-wrap: wrap; justify-content: flex-end; }
-@media (max-width: 1100px) { .entry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } :deep(.page-head) { flex-wrap: wrap; } }
-@media (max-width: 600px) { .entry-summary { gap: 10px; } .entry-summary > div { padding: 14px; } .entry-summary strong { font-size: 25px; } .src-grid { grid-template-columns: minmax(0, 1fr); } .data-entry-page > .panel { padding: 14px; } :deep(.el-dialog) { max-width: calc(100vw - 24px); } }
+@media (max-width: 1100px) { :deep(.page-head) { flex-wrap: wrap; } }
+@media (max-width: 600px) { .src-grid { grid-template-columns: minmax(0, 1fr); } .data-entry-page > .panel { padding: 14px; } :deep(.el-dialog) { max-width: calc(100vw - 24px); } .entry-meta { display: none; } }
+
+/* 内联巡检状态点 */
+.health-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.health-dot.dot-绿 { background: #3fb27f; }
+.health-dot.dot-黄 { background: #e6a23c; }
+.health-dot.dot-红 { background: #e35d5d; }
+.stale-warn { color: #e6a23c !important; }
+.stale-tag { color: #94a3b8; font-size: 12px; }
+.stale-tag.stale-warn { font-weight: 600; }
+.troubleshoot-list { margin: 6px 0 0 18px; padding: 0; color: #475569; font-size: 13px; line-height: 1.9; }
 </style>

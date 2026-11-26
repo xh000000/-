@@ -1,6 +1,6 @@
 /* 侧边菜单：分组结构与《研枢系统用户操作手册》一致；未接入模块保留位置并置灰，不提供空壳页面。 */
 import {
-  Aim, Box, Collection, Connection, DataBoard, DataLine, Document, Finished,
+  Aim, Box, ChatDotRound, Collection, Connection, DataBoard, DataLine, Document, Finished,
   Grid, MagicStick, Monitor, Odometer, Picture, PieChart, Setting, Share,
   Tickets, Tools, TrendCharts, User, View,
 } from '@element-plus/icons-vue';
@@ -11,9 +11,9 @@ export const MENU = [
   {
     label: '研报管理', icon: Document, children: [
       { label: '研报中心', path: '/reports' },
+      { label: '观点库', path: '/viewpoints' },
       { label: '分类列表', path: '/config/categories', admin: true },
       { label: '作者管理', path: '/config/authors', admin: true },
-      { label: '品种管理', path: '/config/commodities', admin: true },
       { label: '云盘', path: '/library/cloud' },
       { label: '文档管理库', path: '/library/docs' },
       { label: '素材库', path: '/library/materials' },
@@ -62,9 +62,10 @@ export const MENU = [
   },
   { label: '供应分析', icon: Box, disabled: true, children: [{ label: '装置检修' }] },
   {
-    label: '工具箱', icon: Tools, disabled: true, children: [
+    label: '工具箱', icon: Tools, children: [
+      { label: 'AI问答', path: '/agent' },
       { label: '商品价格曲线' }, { label: '持仓分析' }, { label: '联储观察' },
-      { label: '预警管理' }, { label: 'AI问答' },
+      { label: '预警管理' },
     ],
   },
   {
@@ -79,8 +80,10 @@ export const MENU = [
       { label: '账号管理', path: '/system/users', admin: true },
       { label: '角色管理', path: '/system/roles', admin: true },
       { label: '审批流设置', path: '/config/flows', admin: true },
+      { label: '品种管理', path: '/config/commodities', admin: true },
       { label: '外部模型', path: '/system/models', admin: true },
       { label: '菜单管理', path: '/system/menus', admin: true },
+      { label: '指标管理', path: '/system/scope-library', admin: true },
     ],
   },
 ];
@@ -112,9 +115,10 @@ const PERMISSIONS = {
   '/data': '数据中心', '/data/indicators': '数据中心',
   '/library/cloud': '云盘', '/library/docs': '文档管理库', '/library/materials': '素材库',
   '/config/categories': '分类配置', '/config/authors': '作者管理',
-  '/config/commodities': '品种管理', '/config/flows': '审批流配置',
+  '/config/commodities': '系统管理', '/config/flows': '审批流配置',
   '/system/departments': '部门管理', '/system/users': '系统管理', '/system/roles': '角色管理',
   '/system/models': '系统管理', '/system/settings': '系统管理', '/system/menus': '系统管理',
+  '/system/scope-library': '系统管理',
 };
 
 export function filterMenu(items, account, visibility = {}) {

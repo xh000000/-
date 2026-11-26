@@ -70,6 +70,8 @@ export async function logout() {
     await api('logout', {});
   } finally {
     session.data = null;
+    /* 页签是本会话的浏览轨迹，换账号登录不该继承上一个账号开过的页面 */
+    sessionStorage.removeItem('app.tabs.v1');
   }
 }
 

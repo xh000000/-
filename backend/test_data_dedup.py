@@ -56,7 +56,7 @@ class Dedup(unittest.TestCase):
         # Reproduce an old database without the new unique constraint.
         with self.engine.begin() as c:
             c.execute(text('DROP TABLE observations'))
-            c.execute(text('CREATE TABLE observations (id INTEGER PRIMARY KEY, source TEXT, indicator TEXT, date TEXT, value FLOAT, unit TEXT, uploaded_by TEXT)'))
+            c.execute(text('CREATE TABLE observations (id INTEGER PRIMARY KEY, source TEXT, indicator TEXT, date TEXT, value FLOAT, unit TEXT, uploaded_by TEXT, indicator_id INTEGER)'))
         with Session(self.engine) as s:
             s.add_all([Observation(**self.row(1)), Observation(**self.row(2, source='sina'))])
             s.commit()

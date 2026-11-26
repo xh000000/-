@@ -1,4 +1,4 @@
-"""数据层：SQLAlchemy 2.0 ORM 映射（18 张表）与建模配套工具。
+"""数据层：SQLAlchemy 2.0 ORM 映射（20 张表）与建模配套工具。
 
 分工
 ----
@@ -121,6 +121,8 @@ class Report(Base, MappingMixin):
     issue: Mapped[int | None] = mapped_column(Integer, default=0)
     deleted: Mapped[int | None] = mapped_column(Integer, default=0)
     scheduled_at: Mapped[str | None] = mapped_column(Text, default='')
+    ai_draft: Mapped[int | None] = mapped_column(Integer, default=0)  # 1=含 AI 生成内容，须人工复核
+    ai_summary: Mapped[str | None] = mapped_column(Text, default='')  # AI 摘要卡 JSON：核心观点/逻辑链/数据要点
 
 
 class Version(Base, MappingMixin):
@@ -149,6 +151,11 @@ class Event(Base, MappingMixin):
 
 
 class Observation(Base, MappingMixin):
+    """一个数据点：某来源、某指标、某日期的取值。
+
+    ``indicator_id`` 指向 ``dim_indicators``，是指标身份的稳定标识；``indicator``
+    文本列保留为冗余显示名，供既有查询与报表直接取用。改名时 id 不变、文本列级联更新。
+    """
     __tablename__ = 'observations'
     __table_args__ = (UniqueConstraint('source', 'indicator', 'date', name='uq_observation_point'),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -158,6 +165,7 @@ class Observation(Base, MappingMixin):
     value: Mapped[float | None] = mapped_column(Float)
     unit: Mapped[str | None] = mapped_column(Text)
     uploaded_by: Mapped[str | None] = mapped_column(Text)
+    indicator_id: Mapped[int | None] = mapped_column(Integer, index=True)  # → dim_indicators.id
 
 
 class PublicationHistory(Base, MappingMixin):
@@ -193,12 +201,20 @@ class CategoryMigration(Base, MappingMixin):
 
 
 class Commodity(Base, MappingMixin):
+    """品种字典：板块（parent_id 为空）→ 品种（两级）。
+
+    code 是交易所合约代码（CU、I、IF/IH/IC/IM），exchange 是交易所短码，
+    aliases 存别名 JSON，用于把指标名自动拆成品种；position 决定板块内排序。
+    """
     __tablename__ = 'commodities'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(Text, unique=True)
     parent_id: Mapped[int | None] = mapped_column(Integer)
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
     code: Mapped[str | None] = mapped_column(Text, default='')
+    exchange: Mapped[str | None] = mapped_column(Text, default='')
+    aliases: Mapped[str | None] = mapped_column(Text, default='')
+    position: Mapped[int | None] = mapped_column(Integer, default=0)
 
 
 class Author(Base, MappingMixin):
@@ -346,6 +362,124 @@ class DataSyncJob(Base, MappingMixin):
     finished_at: Mapped[str | None] = mapped_column(Text, default='')
     message: Mapped[str | None] = mapped_column(Text, default='')
 
+
+class DataScopePreset(Base, MappingMixin):
+    """【历史】候选清单预置库。
+
+    v1 时代用「分组名 + 指标名」两列裸文本描述指标，既没有分组表，也没有指标身份，
+    改名就会把历史数据切成两段。现由 ``DimGroup`` / ``DimIndicator`` 接管；
+    此表仅在迁移时读取一次，不再写入，保留它是为了老库回滚时仍能查到来龙去脉。
+    """
+    __tablename__ = 'data_scope_presets'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_name: Mapped[str] = mapped_column(Text)             # 分组：现货价 / 库存 / 开工率…
+    item: Mapped[str] = mapped_column(Text, unique=True)      # 候选项，如 螺纹钢现货价
+    position: Mapped[int | None] = mapped_column(Integer, default=0)  # 展示顺序
+
+
+class DimGroup(Base, MappingMixin):
+    """指标分组（一级目录）。有 id、有编码、有位置，允许空分组。
+
+    ``code`` 与指标编码同规矩：创建时定下、发布后不变，改名不影响它。
+    ``builtin=1`` 的是系统组（如「未分组」），用来接住那些还没归类的指标，不允许删除。
+    """
+    __tablename__ = 'dim_groups'
+    __table_args__ = {'sqlite_autoincrement': True}          # id 永不复用，编码才不会撞
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str | None] = mapped_column(Text, default='')      # GRP00001，稳定标识
+    name: Mapped[str] = mapped_column(Text, unique=True)
+    position: Mapped[int | None] = mapped_column(Integer, default=0)
+    builtin: Mapped[int | None] = mapped_column(Integer, default=0)
+    created_at: Mapped[str | None] = mapped_column(Text, default='')
+
+
+class DimIndicator(Base, MappingMixin):
+    """指标主数据。``id`` 是身份，``name`` 只是显示名，可以改而不影响历史数据归属。
+
+    字段按行业指标体系规范（编码 + 标准名称双轨）落地：
+    - ``code``：稳定标识，自动生成 ``IND00001``，发布后不复用；外部引用只认它
+    - ``name``：标准名，形如「品种 + 指标类型」，改名不动 id
+    - ``commodity``：品种维度（螺纹钢 / 焦煤…），从名字里拆出来才能按品种筛选
+    - ``aliases``：别名，同一概念的其它叫法登记在此，不另建指标（治「XX成交量 / XX成交量快照」分裂）
+    - ``enabled``：停用代替删除，已入库的历史数据不会因为删字典而变成孤儿
+
+    改名走 ``datasource.rename_indicator``：id 不变，同时把 observations 的冗余文本列
+    与各数据源配置里的名字一并更新，所以数据不会断链。
+    """
+    __tablename__ = 'dim_indicators'
+    __table_args__ = {'sqlite_autoincrement': True}          # id 永不复用
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str | None] = mapped_column(Text, unique=True)        # IND00001，稳定标识
+    name: Mapped[str] = mapped_column(Text, unique=True)                # 标准显示名
+    group_id: Mapped[int | None] = mapped_column(Integer, index=True)   # → dim_groups.id
+    commodity: Mapped[str | None] = mapped_column(Text, default='')     # 品种维度
+    aliases: Mapped[str | None] = mapped_column(Text, default='[]')     # JSON 数组，别名不另建指标
+    unit: Mapped[str | None] = mapped_column(Text, default='')
+    enabled: Mapped[int | None] = mapped_column(Integer, default=1)     # 1 启用 / 0 停用
+    position: Mapped[int | None] = mapped_column(Integer, default=0)
+    created_at: Mapped[str | None] = mapped_column(Text, default='')
+    updated_at: Mapped[str | None] = mapped_column(Text, default='')
+
+
+
+
+class AgentThread(Base, MappingMixin):
+    """一条 Agent 对话线程。消息本体在 LangGraph 的 checkpoint 库里，
+    这张表只管归属与列表：谁开的线程、叫什么、最后活跃时间。"""
+    __tablename__ = 'agent_threads'
+    id: Mapped[str] = mapped_column(Text, primary_key=True)   # uuid hex，同时是 checkpoint thread_id
+    user_id: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str | None] = mapped_column(Text, default='新对话')
+    created_at: Mapped[str | None] = mapped_column(Text, default='')
+    updated_at: Mapped[str | None] = mapped_column(Text, default='')
+
+
+class AgentTask(Base, MappingMixin):
+    """一个后台 Agent 任务：排队中 / 运行中 / 已完成 / 失败。
+
+    页面 SSE 对话走同步流；批量场景（如「把六个板块都写一版」）投递到这里，
+    由单个 worker 线程顺序执行，结果落在 result 列，页面轮询取回。
+    """
+    __tablename__ = 'agent_tasks'
+    id: Mapped[str] = mapped_column(Text, primary_key=True)   # uuid hex
+    thread_id: Mapped[str | None] = mapped_column(Text, default='')
+    user_id: Mapped[int | None] = mapped_column(Integer)
+    message: Mapped[str | None] = mapped_column(Text, default='')
+    status: Mapped[str | None] = mapped_column(Text, default='排队中')
+    result: Mapped[str | None] = mapped_column(Text, default='')
+    error: Mapped[str | None] = mapped_column(Text, default='')
+    created_at: Mapped[str | None] = mapped_column(Text, default='')
+    started_at: Mapped[str | None] = mapped_column(Text, default='')
+    finished_at: Mapped[str | None] = mapped_column(Text, default='')
+
+
+class Viewpoint(Base, MappingMixin):
+    """一条研究观点（观点库）：谁在什么时间、对哪个品种、看了哪个方向、依据是什么。
+
+    结算（回溯）机制：观点带基准价与观察期，到期后取指标库价格对照涨跌，
+    按 ETA《数据报表管理》观点考核的口径给出「正确 / 错误 / 持平 / 无法结算」——
+    让「当初看多，后来涨没涨」可量化，支撑研究员能力画像。
+    """
+    __tablename__ = 'viewpoints'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer)
+    user_name: Mapped[str | None] = mapped_column(Text, default='')
+    commodity: Mapped[str | None] = mapped_column(Text)                       # 品种名（对应 commodities）
+    direction: Mapped[str | None] = mapped_column(Text)                       # 看多 / 看空 / 震荡
+    basis: Mapped[str | None] = mapped_column(Text, default='')               # 观点依据（1000 字内）
+    benchmark_price: Mapped[float | None] = mapped_column(Float)              # 基准价
+    benchmark_date: Mapped[str | None] = mapped_column(Text, default='')      # 基准日 YYYY-MM-DD
+    horizon_days: Mapped[int | None] = mapped_column(Integer, default=5)      # 观察期（自然日）
+    expire_date: Mapped[str | None] = mapped_column(Text, default='')         # 结算日 = 基准日 + 观察期
+    benchmark_indicator: Mapped[str | None] = mapped_column(Text, default='') # 用的哪个指标（溯源）
+    result_price: Mapped[float | None] = mapped_column(Float)                 # 结算价
+    result_date: Mapped[str | None] = mapped_column(Text, default='')         # 实际取到的价格日期
+    change_pct: Mapped[float | None] = mapped_column(Float)                   # 区间涨跌幅 %
+    outcome: Mapped[str | None] = mapped_column(Text, default='')             # 正确 / 错误 / 持平 / 无法结算
+    status: Mapped[str | None] = mapped_column(Text, default='在途')           # 在途 / 已结算
+    note: Mapped[str | None] = mapped_column(Text, default='')                # 结算说明 / 失效原因
+    created_at: Mapped[str | None] = mapped_column(Text, default='')
+    settled_at: Mapped[str | None] = mapped_column(Text, default='')
 
 
 # --------------------------------------------------------------------------

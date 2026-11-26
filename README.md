@@ -34,8 +34,16 @@ futures-research-separated/
     manual_engine.py       分类树、作者/品种、章节协作及访问权限
     library_engine.py      云盘、文档、素材资料与批量操作
     iam_engine.py          账号、部门、角色菜单、审批流、修改密码
+    agent/                 Agent 服务层（LangGraph 智能体基座，可选依赖）
+      config.py            AGENT_* 独立模型配置，逐项回落平台外部模型
+      memory.py            会话记忆（SqliteSaver，独立 agent_memory.db）
+      tools.py             平台工具注册表：查研报/指标/品种/资料 + 受限写章节
+      graph.py             ReAct 智能体（create_react_agent + 系统提示词）
+      service.py           SSE 事件流、对话线程、后台任务队列
+      routes.py            /api/agent/* 路由
     printview.py           服务端打印视图（A4 研报版式，浏览器可另存为 PDF）
     richtext.py            富文本 HTML 白名单清洗
+    test_agent.py          Agent 服务层测试，不属于运行依赖
     test_workflow.py       后端自动化测试，不属于运行依赖
     Dockerfile             后端镜像
   dev.py                   可选：不装 Node 时预览已构建的 dist（静态 + /api 代理）
@@ -126,6 +134,9 @@ npm run build        # 产出 frontend/dist
 # 后端：接口、权限、审批流、定时发布、打印视图，使用临时库
 python backend/test_workflow.py
 
+# Agent 服务层：状态、线程、SSE 降级、后台任务、工具链路（无需模型密钥）
+python backend/test_agent.py
+
 # 前端：真实 Chromium 登录并逐页渲染，收集控制台报错（需前端与后端已启动）
 cd frontend && npm run smoke
 ```
@@ -186,6 +197,95 @@ cd frontend && npm run smoke
 | 农产品 | 棕榈油 P ｜ 豆油 Y ｜ 菜籽油 OI ｜ 豆粕 M ｜ 棉花 CF ｜ 白糖 SR |
 
 日度策略各板块章节的 `commodity_ids` 由该表自动写入，新建报告时带到章节上；`综合` 保留为综合研究题材。品种改名或停用后，历史报告的关联以创建时的标识为准。
+
+## Agent 服务层（LangGraph 智能体基座）
+
+后端在业务引擎之上新增一层 Agent 服务：LangGraph ReAct 智能体可以调用平台工具
+（查研报、读章节、查指标序列、查品种库、搜资料库），并把候选章节草稿写回平台——
+写操作复用 `/api/chapter/save` 的全部校验链（权限、版本快照、操作留痕），
+内容始终是「候选草稿」，必须人工核对后才能送审。
+
+```text
+backend/agent/
+  config.py   模型配置：AGENT_* 环境变量优先，未配置的项逐项回落页面外部模型（AI_*）
+  memory.py   会话记忆：LangGraph SqliteSaver，独立文件 agent_memory.db（不混业务库）
+  tools.py    工具注册表：新工具在 _registry 加一行，状态页清单自动更新
+  graph.py    智能体：create_react_agent + 按用户/日期动态生成的系统提示词
+  service.py  SSE 事件流（token/工具调用/结果）、线程管理、单 worker 后台任务队列
+  pipeline.py AI 日报流水线：取数 → 逐板块写稿 → 自动建报告 → 送研究复核
+  summarize.py 研报 AI 秒读：核心观点/逻辑链/数据要点三段式摘要卡
+  routes.py   REST + SSE 路由，复用平台 Cookie 会话与 CSRF 校验
+```
+
+依赖为可选：`requirements.txt` 里 langchain 系列未安装时，启动日志会提示
+`agent layer disabled`，平台以无 Agent 模式运行，其余功能不受影响。
+langchain 导入全部惰性化，`import app` 保持秒级，定时任务等子进程不受拖累。
+
+### 配置
+
+`.env`（参考 `.env.example`）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `AGENT_API_KEY` / `AGENT_MODEL` / `AGENT_BASE_URL` | Agent 专用模型，逐项独立生效；某项未配置时回落到平台外部模型，都不配则 Agent 不可用 |
+| `AGENT_MAX_TOKENS` / `AGENT_TEMPERATURE` / `AGENT_TIMEOUT` | 单次输出上限、采样温度、调用超时 |
+| `AGENT_RECURSION_LIMIT` | 单轮对话最多工具调用循环数（默认 40） |
+| `AGENT_PIPELINE_TIME` | AI 日报定时触发（UTC HH:MM）；留空则只在页面手动触发，每天最多自动跑一次 |
+
+### API（全部要求登录）
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/agent/status` | 是否已配置、模型出处、工具清单 |
+| `GET/POST/DELETE /api/agent/threads` | 对话线程管理（消息记忆随线程保存，删除连带清记忆） |
+| `GET /api/agent/threads/{id}/messages` | 回放历史消息 |
+| `POST /api/agent/chat` | SSE 流式对话：`start` / `token` / `tool_start` / `tool_end` / `done` / `error` 事件 |
+| `POST /api/agent/tasks` | 投递后台任务（单 worker 顺序执行），`GET /api/agent/tasks/{id}` 轮询结果 |
+| `POST /api/agent/pipeline/run` | 触发 AI 日报流水线（后台执行，结果摘要含报告 id 与各章节状态） |
+| `POST /api/agent/summary` | 为研报生成三段式 AI 摘要卡（写进 `reports.ai_summary`，列表随 to_dict 带出） |
+
+### 安全与合规约束
+
+- 工具按当前登录用户构建：读工具走 `manual.can_view` 口径，看不见的报告读不到；
+  写工具仅限草稿/已退回状态、本人可编辑的章节。
+- 系统提示词写死行为规则：数据必须来自工具返回的真实数据并注明来源与日期；
+  禁止「保本、稳赚、保证收益、必涨、必跌」类表述；观点必须附风险提示。
+- Agent 不能提交、审批、发布——流程决定权始终在人。
+- Agent 产出的报告自动打上 `ai_draft=1` 标记：研报列表显示「AI 初稿」徽标，
+  并追加 `AI 初稿` 留痕事件；AI 日报流水线生成的报告只会推进到「研究复核」，
+  复核 → 合规 → 发布必须由对应角色人工操作（见 `reports.ai_draft` 列）。
+
+### 前端（AI 问答）
+
+侧边菜单「工具箱 → AI问答」（`/agent`）即对话界面：左侧对话线程列表（新建 / 切换 / 删除，删除连带清记忆），
+右侧消息区流式渲染（token 增量、工具调用徽标、停止按钮），未配置模型时显示引导提示而非空壳。
+对话请求走 `POST /api/agent/chat` 的 SSE 流，`Ctrl+Enter` 发送；浏览器冒烟已覆盖该页面。
+页头「AI 日报」按钮一键触发流水线：自动取数、逐板块生成初稿、创建报告并推进到研究复核，
+完成后弹窗汇报章节撰写情况（对标同业「分钟级初稿 + 研究员复核」模式）。
+
+## 观点库与准确率回溯（对标 ETA 观点考核 / 中泰后台）
+
+`backend/viewpoint.py`（路由 `/api/viewpoints/*`，纯业务模块，无 langchain 依赖）：
+
+- **登记观点**：品种、方向（看多/看空/震荡）、依据、观察期（1~90 自然日）；
+  基准价自动取指标库最新价（优先级：现货价 → 收盘价 → 结算价 → 最新点位），也可手工填写；
+- **自动回溯**：到期后取同一指标在结算日前最近的价格，对照基准价算区间涨跌幅，
+  按 ±1% 阈值判「正确 / 错误 / 持平」，无价格数据标「无法结算」——绝不编造结果；
+  访问列表时自动结算到期观点，也可提前手动结算；
+- **画像**：按观点人、按品种统计正确率与方向分布（`GET /api/viewpoints/stats`）。
+
+前端菜单「研报管理 → 观点库」（`/viewpoints`）：整体正确率卡片、筛选表格、
+研究员画像与品种正确率两块面板、登记观点弹窗。
+
+## 数据录入增强（对标 ETA 数据报表管理）
+
+- **数据源巡检看板**：`GET /api/data/sources` 额外返回 `health`——每来源近 30 天
+  同步成功率、最近成功时间、滞后指标数（最新数据距今 > 3 天）、异常配置数，
+  前端按红/黄/绿三档展示；
+- **新鲜度**：`stats()` 带每来源 `stale_days` 与 `late_indicators`，
+  指标目录（`catalog()`）每行带 `stale_days`/`stale`，来源卡片显示「滞后 X 天」；
+- **失败排查**：同步作业与取数配置失败时自动分类原因（凭据/鉴权、接口限流、
+  参数/指标编码、网络/超时），详情弹窗给出对应排查步骤清单。
 
 ## 与操作手册的差距
 

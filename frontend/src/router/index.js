@@ -13,7 +13,9 @@ const routes = [
     component: () => import('../layout/AppLayout.vue'),
     children: [
       { path: '', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '工作台' } },
+      { path: 'agent', name: 'agent', component: () => import('../views/AgentChatView.vue'), meta: { title: 'AI 问答' } },
       { path: 'reports', name: 'reports', component: () => import('../views/ReportListView.vue'), meta: { title: '研报中心' } },
+      { path: 'viewpoints', name: 'viewpoints', component: () => import('../views/ViewpointsView.vue'), meta: { title: '观点库' } },
       { path: 'approval', name: 'approval', component: () => import('../views/ApprovalView.vue'), meta: { title: '审核中心' } },
       {
         path: 'library/:area(cloud|docs|materials)',
@@ -32,6 +34,7 @@ const routes = [
       { path: 'system/roles', name: 'roles', component: () => import('../views/RolesView.vue'), meta: { title: '角色管理', admin: true } },
       { path: 'system/menus', name: 'menus', component: () => import('../views/MenuManagementView.vue'), meta: { title: '菜单管理', admin: true } },
       { path: 'system/models', name: 'models', component: () => import('../views/ExternalModelsView.vue'), meta: { title: '外部模型', admin: true } },
+      { path: 'system/scope-library', name: 'scopeLibrary', component: () => import('../views/ScopeLibraryView.vue'), meta: { title: '指标管理', admin: true } },
       { path: 'system/settings', name: 'settings', redirect: { name: 'models' }, meta: { admin: true } },
     ],
   },

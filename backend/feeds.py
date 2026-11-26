@@ -34,8 +34,9 @@ KINDS = [
     {'key': 'eastmoney_snapshot', 'label': '东方财富 · 最新指数快照', 'hint': '最新点位与成交量，按行情时间入库，不是历史日线'},
     {'key': 'eastmoney_index', 'label': '东方财富 · 指数日线', 'hint': '公开指数日线（收盘点位 / 成交量）'},
     {'key': 'sina_index', 'label': '新浪财经 · 指数日线', 'hint': '公开指数日线（收盘点位 / 成交量）'},
-    {'key': 'generic_json', 'label': '通用 JSON 接口', 'hint': '任意 HTTP 接口，配请求模板与响应路径'},
+    {'key': 'generic_json', 'label': '通用 JSON 接口', 'hint': '任意 HTTP 接口，配请求模板与响应路径（SMM 等自有账号 API 可用此通道）'},
     {'key': 'ifind_http', 'label': '同花顺 iFinD（HTTP）', 'hint': 'access_token + 历史行情，字段名可改'},
+    {'key': 'windpy', 'label': 'Wind · 本机终端（WindPy）', 'hint': '本机装有已登录的 Wind 金融终端（MAC 绑定账号），凭据留在终端侧'},
 ]
 
 FREQS = [
@@ -60,6 +61,8 @@ DEFAULT_OPTIONS = {
 }
 
 # iFinD 历史行情的指标字段名（官方文档若调整，在页面 options.field_map 改即可）
+IFIND_BASE = 'https://ft.10jqka.com.cn'
+
 IFIND_FIELDS = {
     'close': 'close', 'settle': 'settle', 'volume': 'volume',
     'open_interest': 'openInterest', 'spot': 'close', 'inventory': 'value',
@@ -248,6 +251,80 @@ PUBLIC_URLS = {
     'sina_index': 'https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData',
 }
 
+# ---------------------------------------------------------------------------
+# WindPy 本机终端通道：MAC 绑定的终端账号没有独立 API 凭据，取数靠本机已登录
+# 的 Wind 金融终端。凭据始终留在终端侧，平台只负责把取到的行幂等入库。
+# 范围条目格式：指标名|Wind代码|通道（wsd=行情，edb=宏观 EDB），如：
+#   螺纹钢主连|RBZL.SHF|wsd     南华商品指数|M002122626|edb
+# ---------------------------------------------------------------------------
+_WSD_FIELDS = {'index_last': 'close', 'index_close': 'close', 'close': 'close',
+               'settle': 'settle', 'volume': 'volume', 'open_interest': 'oi'}
+
+_wind_session = None
+
+
+def _windpy():
+    """拿到已连接的 WindPy w 对象；终端没装/没登录时给出人话报错。"""
+    global _wind_session
+    if _wind_session is not None:
+        return _wind_session
+    try:
+        from WindPy import w
+    except ImportError:
+        raise FeedError('本机未安装 WindPy：请先安装 Wind 金融终端并执行 pip install WindPy')
+    try:
+        if not w.isconnected():
+            w.start(waitTimeout=60)
+        if not w.isconnected():
+            raise RuntimeError('连接超时')
+    except Exception as exc:
+        raise FeedError('连不上 Wind 金融终端：%s。请确认本机装有 Wind 终端且已用授权账号登录（MAC 绑定的账号只能在绑定的机器上登录）' % exc)
+    _wind_session = w
+    return _wind_session
+
+
+def _rows_windpy(config: DataSourceConfig, item: str, code: str, metric: str,
+                 start: str, end: str, days: int, options: dict) -> list[dict]:
+    parts = [p.strip() for p in str(item).split('|')]
+    if len(parts) != 3 or not parts[1]:
+        raise FeedError('范围条目需为「指标名|Wind代码|通道(wsd或edb)」，如 螺纹钢主连|RBZL.SHF|wsd')
+    name, wind_code, channel = parts
+    w = _windpy()
+    if channel == 'edb':
+        # EDB 宏观/行业指标：一个条目一条序列，与所选行情指标无关
+        result, df = w.edb(wind_code, start, end, usedf=True)
+        if int(result) != 0 or df is None or df.empty:
+            raise FeedError('w.edb 返回码 %s，未取到数据（核对 Wind EDB 代码）' % result)
+        units = dict(getattr(df, 'attrs', {}).get('Units') or {})
+        rows = []
+        for day, value in df[wind_code].items() if wind_code in df.columns else []:
+            if value in (None, ''):
+                continue
+            rows.append({'source': config.source, 'indicator': name,
+                         'date': _date_of(str(day)), 'value': float(value),
+                         'unit': units.get(wind_code) or options.get('unit') or '按EDB口径'})
+        return rows
+    if channel != 'wsd':
+        raise FeedError('通道只支持 wsd（行情）或 edb（宏观），收到：%s' % channel)
+    field = (options.get('field_map') or {}).get(metric) or _WSD_FIELDS.get(metric)
+    if not field:
+        raise FeedError('指标「%s」没有对应的 Wind 字段，可在高级设置 field_map 里补'
+                        % datasource.METRIC_LABELS.get(metric, metric))
+    result, df = w.wsd(wind_code, field, start, end, "", usedf=True)
+    if int(result) != 0 or df is None or df.empty:
+        raise FeedError('w.wsd 返回码 %s，未取到数据（核对代码 %s）' % (result, wind_code))
+    column = field if field in df.columns else df.columns[0]
+    unit = _metric_unit(metric, options)
+    rows = []
+    for day, value in df[column].items():
+        if value in (None, ''):
+            continue
+        rows.append({'source': config.source,
+                     'indicator': _fill(options.get('indicator_template') or '{item}{metric_label}',
+                                        {'item': name, 'metric_label': datasource.METRIC_LABELS.get(metric, metric)}),
+                     'date': _date_of(str(day)), 'value': float(value), 'unit': unit})
+    return rows
+
 
 def _rows_public(config, item, code, metric, start, end, days, options):
     if item not in PUBLIC_INDEX_CODES:
@@ -320,8 +397,13 @@ def _rows_public(config, item, code, metric, start, end, days, options):
     return result
 
 
-def _ifind_token(config: DataSourceConfig, options: dict) -> str:
+def _ifind_base(config: DataSourceConfig) -> str:
     base = (config.base_url or '').rstrip('/')
+    return base or IFIND_BASE
+
+
+def _ifind_token(config: DataSourceConfig, options: dict) -> str:
+    base = _ifind_base(config)
     if not base:
         raise FeedError('接口地址为空')
     if not config.secret:
@@ -346,7 +428,7 @@ def _rows_ifind(config: DataSourceConfig, item: str, code: str, metric: str,
     if not field:
         raise FeedError('指标「%s」没有对应的 iFinD 字段，请在高级设置里补 field_map'
                         % datasource.METRIC_LABELS.get(metric, metric))
-    base = (config.base_url or '').rstrip('/')
+    base = _ifind_base(config)
     body = json.dumps({
         'codes': code,
         'indicators': field,
@@ -354,14 +436,20 @@ def _rows_ifind(config: DataSourceConfig, item: str, code: str, metric: str,
         'enddate': end.replace('-', ''),
         'functionpara': {'Fill': 'Blank'},
     }, ensure_ascii=False)
-    text = _http('POST', base + '/api/v1/history_quotes',
+    # 官方手册：历史行情接口为 cmd_history_quotation
+    text = _http('POST', base + '/api/v1/cmd_history_quotation',
                  {'Content-Type': 'application/json', 'access_token': token},
                  body, options.get('timeout') or 20)
-    payload = _json_or_error(text, 'history_quotes')
+    payload = _json_or_error(text, 'cmd_history_quotation')
     if isinstance(payload, dict) and payload.get('errorcode') not in (0, None):
         raise FeedError('取历史行情失败（%s）：%s'
                         % (payload.get('errorcode'), _clip(payload.get('errmsg'), 160)))
-    tables = payload.get('tables') if isinstance(payload, dict) else None
+    # 不同版本响应里 tables 可能挂在顶层或 data 下，两处都认
+    tables = None
+    if isinstance(payload, dict):
+        tables = payload.get('tables')
+        if not isinstance(tables, list):
+            tables = (payload.get('data') or {}).get('tables') if isinstance(payload.get('data'), dict) else None
     if not isinstance(tables, list) or not tables:
         raise FeedError('上游没有返回 tables，响应片段：%s' % _clip(text, 200))
 
@@ -411,7 +499,8 @@ def _prepare(session, payload: dict, config: DataSourceConfig | None = None) -> 
     if kind not in {item['key'] for item in KINDS}:
         raise FeedError('请选择有效的取数方式')
     base_url = str(payload.get('base_url') or PUBLIC_URLS.get(kind, '')).strip()
-    if not base_url.lower().startswith(('http://', 'https://')):
+    # ifind_http 不填地址时回落到官方域名；windpy 走本机终端，没有 URL
+    if kind not in ('windpy', 'ifind_http') and not base_url.lower().startswith(('http://', 'https://')):
         raise FeedError('接口地址需以 http:// 或 https:// 开头')
 
     scope = payload.get('scope') or {}
@@ -504,6 +593,11 @@ def config_dict(config: DataSourceConfig, names: dict | None = None) -> dict:
         'weekday': config.weekday or 1, 'enabled': 1 if config.enabled else 0,
         'last_run': config.last_run or '', 'last_status': config.last_status or '未运行',
         'last_message': config.last_message or '',
+        'reason_type': (datasource.classify_failure(config.last_message)
+                        if config.last_status == '失败' else ''),
+        'troubleshooting': (datasource.TROUBLESHOOTING.get(datasource.classify_failure(config.last_message),
+                                                           datasource.TROUBLESHOOTING['其他'])
+                            if config.last_status == '失败' else []),
         'operator': config.operator or '', 'created_at': config.created_at or '',
         'updated_at': config.updated_at or '',
     }
@@ -544,6 +638,9 @@ def _collect(session, config: DataSourceConfig, options: dict) -> tuple[list[dic
     label = datasource.source_names(session).get(config.source, config.source or '')
     rows, problems = [], []
     for item in items:
+        if item in codes and not codes.get(item):
+            problems.append('%s：是分组类目、没有合约代码，请选择具体品种或改用自定义范围' % item)
+            continue
         code = codes.get(item) or item
         if suffix and '.' not in code:
             code = code + suffix
@@ -553,6 +650,8 @@ def _collect(session, config: DataSourceConfig, options: dict) -> tuple[list[dic
                     got = _rows_public(config, item, code, metric, start, end, days, options)
                 elif config.kind == 'ifind_http':
                     got = _rows_ifind(config, item, code, metric, start, end, days, options, token)
+                elif config.kind == 'windpy':
+                    got = _rows_windpy(config, item, code, metric, start, end, days, options)
                 else:
                     got = _rows_generic(config, item, code, metric, start, end, days, options)
             except FeedError as exc:
@@ -635,6 +734,8 @@ def preview(session, payload: dict) -> dict:
         elif probe.kind == 'ifind_http':
             token = _ifind_token(probe, options)
             rows = _rows_ifind(probe, item, code, metric, start, end, days, options, token)
+        elif probe.kind == 'windpy':
+            rows = _rows_windpy(probe, item, code, metric, start, end, days, options)
         else:
             rows = _rows_generic(probe, item, code, metric, start, end, days, options)
     except FeedError as exc:

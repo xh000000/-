@@ -4,3 +4,11 @@ uvicorn==0.54.0
 SQLAlchemy==2.1.9
 
 truststore==0.10.5
+
+# Agent 服务层（backend/agent/，LangGraph 智能体基座）。
+# 可选依赖：整段注释掉后平台以无 Agent 模式启动，其余功能不受影响。
+langchain==1.5.2
+langchain-openai==1.8.5
+langgraph==1.2.24
+langgraph-checkpoint-sqlite==3.1.3
+

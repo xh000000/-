@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import re
 import urllib.error
 import urllib.request
 import zipfile
@@ -83,8 +84,13 @@ def init() -> None:
         library.migrate(session)
         iam.migrate(session)
         datasource.ensure_sources(session)
+        datasource.ensure_scope_presets(session)
         datasource.migrate_observation_uniqueness(session)
-        database.add_columns(session, 'reports', {'scheduled_at': "TEXT DEFAULT ''"})
+        # 裸名字 → 指标主数据（dim_groups / dim_indicators），幂等，每次启动都兜底回填
+        datasource.migrate_dictionary(session)
+        database.add_columns(session, 'reports', {'scheduled_at': "TEXT DEFAULT ''",
+                                                  'ai_draft': 'INTEGER DEFAULT 0',
+                                                  'ai_summary': "TEXT DEFAULT ''"})
         session.commit()
 
 
@@ -204,6 +210,13 @@ def scheduler() -> None:
             sync_due()
         except Exception as exc:
             print('scheduler-sync', type(exc).__name__, flush=True)
+        try:
+            import agent.pipeline
+            agent.pipeline.schedule_due()  # AI 日报定时流水线（AGENT_PIPELINE_TIME 未配置时为空操作）
+        except ImportError:
+            pass  # 未安装 langchain 系列依赖时跳过
+        except Exception as exc:
+            print('scheduler-pipeline', type(exc).__name__, flush=True)
         time.sleep(30)
 
 
@@ -211,6 +224,11 @@ def scheduler() -> None:
 async def lifespan(_app: FastAPI):
     init()
     threading.Thread(target=scheduler, daemon=True).start()
+    try:
+        import agent.service
+        agent.service.start_worker()  # Agent 后台任务 worker（langchain 未安装时跳过）
+    except ImportError as exc:
+        print('agent disabled:', exc, flush=True)
     print('Research platform (FastAPI): http://%s:%s'
           % (os.getenv('HOST', '127.0.0.1'), os.getenv('PORT', '8080')), flush=True)
     yield
@@ -667,7 +685,9 @@ def get_data_sources(request: Request, session: Session = Depends(get_db)):
         select(database.DataSourceConfig).order_by(database.DataSourceConfig.id)).scalars()]
     return _json({
         'sources': datasource.stats(session),
+        'health': datasource.health(session),
         'metrics': datasource.METRICS,
+        'scope_library': datasource.scope_presets(session),
         'kinds': feeds.KINDS,
         'freqs': feeds.FREQS,
         'jobs': datasource.jobs(session, 8),
@@ -676,6 +696,161 @@ def get_data_sources(request: Request, session: Session = Depends(get_db)):
         'can_sync': user['role'] in ('admin', 'researcher'),
         'can_config': admin,
     })
+
+
+# 候选清单（预置库与来源清单共用）的字符规范
+SCOPE_ITEM_RE = re.compile(r'^[\w\u4e00-\u9fa5|.\-/%()（）·、]+$')
+
+
+def _dict_call(fn, *args, **kwargs):
+    """指标库的「不合法」统一表达成 400：与 _feed_guard 同口径，页面直接显示原因。"""
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as exc:
+        raise ApiError(400, str(exc))
+
+
+@app.post('/api/data/scope-library', summary='指标库新增指标')
+async def post_scope_preset(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    raw_items = data.get('items')
+    if not isinstance(raw_items, list):
+        raw_items = [data.get('item')]
+    names = [str(x or '').strip()[:60] for x in raw_items]
+    names = [x for x in names if x]
+    if not names:
+        raise ApiError(400, '请填写指标名')
+    for name in names:
+        if not SCOPE_ITEM_RE.match(name):
+            raise ApiError(400, '指标名含不支持的字符：%s（只允许中文、字母、数字与 | . - _ / %% ( ) 等）' % name)
+    # 分组优先按 id 定位；只给了名字且库里没有，就顺手建组——「填一次就完事」的体验不变
+    group_id = data.get('group_id')
+    group_name = str(data.get('group') or '').strip()[:20]
+    group_code = str(data.get('group_code') or '').strip()
+    if group_id:
+        group = _dict_call(datasource.find_group, session, group_id)
+    elif group_name:
+        # 分组已存在时 ensure_group 直接返回，group_code 不会改动原分组编码
+        group = _dict_call(datasource.ensure_group, session, group_name, group_code)
+    else:
+        raise ApiError(400, '请选择或填写分组')
+    exists = session.execute(select(database.DimIndicator.name)
+                             .where(database.DimIndicator.name.in_(names))).scalars().all()
+    if exists:
+        raise ApiError(400, '指标已存在：%s' % '、'.join(exists))
+    code = str(data.get('code') or '').strip()
+    if code and len(names) > 1:
+        raise ApiError(400, '一次新增多条时不能指定同一个编码，会自动生成')
+    # 品种取自品种管理；不传则按名称前缀自动识别，传空串表示明确不挂品种
+    commodity = data.get('commodity') if 'commodity' in data else None
+    for name in names:
+        _dict_call(datasource.ensure_indicator, session, name, group.id, code, commodity)
+    session.commit()
+    return _json({'ok': True, 'library': datasource.scope_presets(session)})
+
+
+@app.post('/api/data/scope-library/update', summary='指标库编辑指标')
+async def post_scope_preset_update(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    new_name = str(data.get('name') or data.get('item') or '').strip()[:60]
+    if new_name and not SCOPE_ITEM_RE.match(new_name):
+        raise ApiError(400, '指标名含不支持的字符：%s（只允许中文、字母、数字与 | . - _ / %% ( ) 等）' % new_name)
+    row = _dict_call(datasource.resolve_indicator, session, data.get('id'),
+                     data.get('old_item') or data.get('item'))
+    cascade = {}
+    if new_name and new_name != row.name:
+        cascade = _dict_call(datasource.rename_indicator, session, row.id, new_name)
+    if 'code' in data:
+        _dict_call(datasource.set_indicator_code, session, row.id, data.get('code'))
+    if 'commodity' in data:
+        _dict_call(datasource.set_indicator_commodity, session, row.id, data.get('commodity'))
+    group_id = data.get('group_id')
+    group_name = str(data.get('group') or '').strip()[:20]
+    if group_id:
+        _dict_call(datasource.move_indicator, session, row.id, group_id)
+    elif group_name and group_name != datasource.group_name(session, row.group_id):
+        group = _dict_call(datasource.ensure_group, session, group_name)
+        _dict_call(datasource.move_indicator, session, row.id, group.id)
+    session.commit()
+    return _json({'ok': True, 'cascade': cascade, 'library': datasource.scope_presets(session)})
+
+
+@app.post('/api/data/scope-library/delete', summary='指标库删除指标')
+async def post_scope_preset_delete(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    names = [str(x).strip() for x in (data.get('items') or ([] if not data.get('item') else [data.get('item')])) if str(x).strip()]
+    ids = [int(x) for x in (data.get('ids') or []) if str(x).strip()]
+    if not names and not ids:
+        raise ApiError(400, '请指定要删除的指标')
+    rows = []
+    if ids:
+        rows = session.execute(select(database.DimIndicator)
+                               .where(database.DimIndicator.id.in_(ids))).scalars().all()
+    elif names:
+        rows = session.execute(select(database.DimIndicator)
+                               .where(database.DimIndicator.name.in_(names))).scalars().all()
+    if not rows:
+        raise ApiError(404, '指标不存在')
+    for row in rows:
+        _dict_call(datasource.delete_indicator, session, row.id)
+    session.commit()
+    return _json({'ok': True, 'removed': len(rows), 'library': datasource.scope_presets(session)})
+
+
+@app.post('/api/data/scope-library/group', summary='新建分组')
+async def post_scope_group(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    name = str(data.get('name') or '').strip()[:20]
+    if not name or not SCOPE_ITEM_RE.match(name):
+        raise ApiError(400, '分组名含不支持的字符：%s（只允许中文、字母、数字与 | . - _ / %% ( ) 等）' % name)
+    _dict_call(datasource.create_group, session, name, str(data.get('code') or '').strip())
+    session.commit()
+    return _json({'ok': True, 'library': datasource.scope_presets(session)})
+
+
+@app.post('/api/data/scope-library/group/update', summary='分组改名')
+async def post_scope_group_update(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    name = str(data.get('name') or '').strip()[:20]
+    if not name or not SCOPE_ITEM_RE.match(name):
+        raise ApiError(400, '分组名含不支持的字符：%s（只允许中文、字母、数字与 | . - _ / %% ( ) 等）' % name)
+    _dict_call(datasource.rename_group, session, data.get('id'), name,
+               None if 'code' not in data else str(data.get('code') or '').strip())
+    session.commit()
+    return _json({'ok': True, 'library': datasource.scope_presets(session)})
+
+
+@app.post('/api/data/scope-library/group/delete', summary='删除空分组')
+async def post_scope_group_delete(request: Request, session: Session = Depends(get_db)):
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    _admin(user)
+    data = await payload(request)
+    _dict_call(datasource.delete_group, session, data.get('id'))
+    session.commit()
+    return _json({'ok': True, 'library': datasource.scope_presets(session)})
+
 
 
 def _feed_guard(fn, *args, **kwargs):
@@ -726,7 +901,17 @@ async def post_data_source(request: Request, session: Session = Depends(get_db))
     row.product = str(data.get('product') or '').strip()[:60]
     row.channel = str(data.get('channel') or '').strip()[:200]
     row.scope_mode = 'custom' if str(data.get('scope_mode') or '') == 'custom' else 'commodity'
-    items = [str(x).strip()[:60] for x in (data.get('scope_items') or []) if str(x).strip()]
+    # 候选项规范化：去空白、去重、限长，只允许正常字符——防止把备注或乱码当品种存进清单
+    items, seen = [], set()
+    for x in (data.get('scope_items') or []):
+        item = str(x).strip()[:60]
+        if not item:
+            continue
+        if not SCOPE_ITEM_RE.match(item):
+            raise ApiError(400, '候选项含不支持的字符：%s（只允许中文、字母、数字与 | . - _ / %% ( ) 等）' % item)
+        if item not in seen:
+            seen.add(item)
+            items.append(item)
     row.scope_items = json.dumps(items[:60], ensure_ascii=False)
     row.enabled = 1 if data.get('enabled', True) else 0
     # 改名时把历史观测一起挪过去，否则旧数据会与新名字脱钩
@@ -1597,3 +1782,22 @@ def _make_endpoint(path: str):
 
 for _path in POST_PATHS:
     app.post(_path, summary=('业务接口 ' + _path))( _make_endpoint(_path) )
+
+
+# ---------------------------------------------------------------------------
+# Agent 服务层（LangGraph 智能体基座）
+#
+# 依赖是可选的：requirements.txt 里的 langchain 系列没装时，
+# 平台以无 Agent 模式启动，其余功能不受影响。
+# ---------------------------------------------------------------------------
+try:
+    import agent.routes as agent_routes
+    app.include_router(agent_routes.router)
+    print('agent layer mounted: /api/agent/*', flush=True)
+except ImportError as exc:
+    print('agent layer disabled:', exc, flush=True)
+
+# 观点库与准确率回溯：纯业务模块，无 langchain 依赖，始终启用
+import viewpoint as viewpoint_routes
+app.include_router(viewpoint_routes.router)
+print('viewpoint layer mounted: /api/viewpoints/*', flush=True)

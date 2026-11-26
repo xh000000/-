@@ -11,6 +11,29 @@
     <el-table-column label="报告标题" min-width="170">
       <template #default="{ row }">
         <button class="title-link" :title="row.title" @click="$emit('open', row.id)">{{ row.title }}</button>
+        <el-tag v-if="row.raw.ai_draft" size="small" type="warning" effect="plain" style="margin-left: 6px">AI 初稿</el-tag>
+        <el-popover v-if="row.aiSummary" placement="left-start" :width="380" trigger="click">
+          <template #reference>
+            <el-button link type="primary" size="small" style="margin-left: 6px">AI 秒读</el-button>
+          </template>
+          <div class="ai-summary-pop">
+            <p class="as-label">核心观点</p>
+            <p class="as-core">{{ row.aiSummary.core }}</p>
+            <template v-if="row.aiSummary.logic">
+              <p class="as-label">逻辑链</p>
+              <p class="as-text">{{ row.aiSummary.logic }}</p>
+            </template>
+            <template v-if="row.aiSummary.data?.length">
+              <p class="as-label">数据要点</p>
+              <ul class="as-data">
+                <li v-for="(item, index) in row.aiSummary.data" :key="index">{{ item }}</li>
+              </ul>
+            </template>
+            <p class="as-at">AI 生成 · {{ localTime(row.aiSummary.at) }} · 仅供预览，以报告正文为准</p>
+          </div>
+        </el-popover>
+        <el-button v-else-if="canGenerate" link type="warning" size="small" style="margin-left: 6px"
+                   :loading="summaryBusy === row.id" @click="makeSummary(row)">生成秒读</el-button>
       </template>
     </el-table-column>
     <el-table-column v-if="!compact" label="摘要" min-width="104" show-overflow-tooltip>
@@ -55,9 +78,11 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { ElMessage } from 'element-plus';
 import StatusTag from './StatusTag.vue';
+import { api } from '../api';
 import { localTime, parseJSON } from '../utils/format';
-import { user } from '../store/session';
+import { refresh, user } from '../store/session';
 
 const props = defineProps({
   reports: { type: Array, default: () => [] },
@@ -79,6 +104,22 @@ onMounted(() => {
 });
 onBeforeUnmount(() => window.removeEventListener('resize', measure));
 
+const canGenerate = computed(() => ['admin', 'researcher'].includes(user.value.role));
+const summaryBusy = ref(null);
+
+async function makeSummary(row) {
+  summaryBusy.value = row.id;
+  try {
+    await api('agent/summary', { id: row.id });
+    await refresh();
+    ElMessage.success('AI 秒读摘要已生成');
+  } catch (error) {
+    ElMessage.error(error.message || '摘要生成失败');
+  } finally {
+    summaryBusy.value = null;
+  }
+}
+
 const rows = computed(() =>
   props.reports.map(report => {
     const meta = parseJSON(report.metadata, null);
@@ -87,6 +128,8 @@ const rows = computed(() =>
       ...report,
       raw: report,
       summary: meta?.summary || '',
+      // AI 三段式摘要卡（核心观点/逻辑链/数据要点），由「AI 秒读」入口生成
+      aiSummary: parseJSON(report.ai_summary, null),
       // 分类快照存的是「一级 / 末级」全路径，列表里只显示末级，避免列宽被路径吃掉
       category: String(cfg?.category_name || report.kind || '').split('/').pop().trim(),
       publishAt: localTime(report.published_at || report.approved_at),
@@ -98,3 +141,13 @@ const rows = computed(() =>
   })
 );
 </script>
+
+<style scoped>
+.ai-summary-pop { margin: -8px -4px; }
+.as-label { margin: 8px 0 3px; color: #909399; font-size: 12px; font-weight: 600; }
+.as-label:first-child { margin-top: 0; }
+.as-core { margin: 0; color: #1f2937; font-size: 13px; font-weight: 600; line-height: 1.6; }
+.as-text { margin: 0; color: #475569; font-size: 12px; line-height: 1.7; }
+.as-data { margin: 4px 0 0 16px; padding: 0; color: #475569; font-size: 12px; line-height: 1.8; }
+.as-at { margin: 10px 0 0; color: #b0b6bf; font-size: 11px; }
+</style>
