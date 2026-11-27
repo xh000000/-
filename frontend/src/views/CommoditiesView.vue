@@ -1,10 +1,10 @@
 <template>
   <div>
     <PageContainer title="品种管理">
+      <template #actions>
+        <el-button type="primary" @click="openDialog(null)">添加品种</el-button>
+      </template>
       <div class="panel">
-        <div class="panel-toolbar">
-          <el-button type="primary" @click="openDialog(null)">添加品种</el-button>
-        </div>
         <el-table
           ref="tableRef"
           :data="tree" row-key="id" :tree-props="{ children: 'children' }" empty-text="暂无品种" border
@@ -255,7 +255,7 @@ async function remove(row) {
 </script>
 
 <style scoped>
-:deep(.el-table) { --el-table-border-color: #eef2f7; }
+
 /* 板块行：不加标签框，只用加粗文字区分 */
-.commodity-group-name { font-weight: 600; color: #183153; }
+.commodity-group-name { font-weight: 600; color: var(--ink-1); }
 </style>

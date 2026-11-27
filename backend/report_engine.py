@@ -275,6 +275,66 @@ def eligibility(s,r,u):
     if node['mode']=='sequential' and u['id']!=next((v for v in node['users'] if v not in ws['approvals']),None):return []
     return ['通过','退回']
 
+ROLE_LABELS={'reviewer':'研究复核人','compliance':'合规审核人','publisher':'发布专员','admin':'管理员','researcher':'研究员'}
+RESERVED_STATUS=['草稿','已退回','待发布','已发布','已撤销']
+
+def _node_state(r):
+    try:
+        cfg=json.loads(r['config_snapshot'] or '{}');ws=json.loads(r['workflow_state'] or '{}')
+        nodes=cfg.get('workflow') or [];index=int(ws.get('index') or 0);approvals=ws.get('approvals') or []
+        if 0<=index<len(nodes):return nodes,index,approvals
+    except (TypeError,ValueError,KeyError):
+        pass
+    return [],0,[]
+
+def edit_state(s,r,u):
+    """一条研报「现在谁能改、为什么不能改、卡在哪个审批节点」。
+
+    与写入侧 manual_engine.editable / section_allowed 保持同一口径：
+      可编辑 = 草稿或已退回，且个人报告为作者本人、多人报告为作者或该章负责人；
+      送审后状态变成审批节点名，正文立即锁定，审批人也只能通过/退回，不能改内容；
+      待发布、已发布只读；作者要改在途报告只能先撤销，撤销后退回可编辑并从头审批。
+    返回 {can_edit, reason, node}，node 含节点名、角色、待处理人，供详情页直接展示。
+    """
+    status=r['status'];author=r['author']==u['id']
+    m=json.loads(r['metadata']) if r['metadata'] else None
+    shared=bool(m and m.get('collaboration')=='shared')
+    collaborator=bool(m and u['id'] in (m.get('collaborators') or []))
+    nodes,index,approvals=_node_state(r)
+    node=nodes[index] if nodes and status not in RESERVED_STATUS else None
+    info={'can_edit':False,'reason':'','node':None}
+    if node:
+        label=node.get('label') or status;role=node.get('role') or ''
+        pending=[x for x in (node.get('users') or []) if x not in approvals]
+        if node.get('mode')=='sequential' and len(pending)>1:pending=pending[:1]
+        names=[]
+        if pending:
+            ids=[int(x) for x in pending if str(x).isdigit()]
+            if ids:names=list(s.execute(select(User.name).where(User.id.in_(ids))).scalars())
+        role_label=ROLE_LABELS.get(role,role)
+        holder='、'.join(names) if names else (role_label or '该节点审批人')
+        info['node']={'label':label,'role':role,'role_label':role_label,'mode':node.get('mode') or 'any',
+                      'pending':names,'index':index+1,'total':len(nodes)}
+        if author:
+            info['reason']='审批中：当前在「%s」节点，由%s处理；如需修改请先撤销，撤销后回到可编辑状态并重新走审批'%(label,holder)
+        elif u['id'] in (node.get('users') or []) or u['role']==role:
+            info['reason']='你是「%s」节点的审批人，只能通过或退回，正文不可修改'%label
+        else:
+            info['reason']='审批中：当前在「%s」节点，你无编辑权限'%label
+        return info
+    if status in ['草稿','已退回']:
+        if shared:
+            info['can_edit']=author or collaborator
+            info['reason']=('已退回：修改后可重新提交审批' if status=='已退回' else '草稿：按章节编辑，仅自己负责且未提交的章节可改') if info['can_edit'] else '仅创建人与章节负责人可编辑'
+        else:
+            info['can_edit']=author
+            info['reason']='已退回：可修改后重新提交审批' if (author and status=='已退回') else ('草稿：可编辑' if author else '仅创建人可编辑')
+        return info
+    info['reason']={'待发布':'已通过审核、等待发布，正文已锁定',
+                    '已发布':'已发布，正文不可修改',
+                    '已撤销':'已撤销，正文不可修改'}.get(status,'当前状态不可编辑')
+    return info
+
 def handle(s,path,d,u,stamp,snapshot,event,checks):
     if path=='/api/categories':
         if u['role']!='admin':return {'error':'仅管理员可配置分类'},403
@@ -353,9 +413,9 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         for node in cfg['workflow']:
             if node['users'] and r.author in node['users']:return {'error':'作者被指定为审核人，请联系管理员调整分类后重新创建报告'},400
             if node['users']:
-                available=s.execute(select(func.count()).select_from(User).where(User.role==node['role'],User.enabled==1,User.id.in_(node['users']))).scalar()
+                available=s.execute(select(func.count()).select_from(User).where(User.role==node['role'],User.enabled==1,func.coalesce(User.status,1)==1,User.id.in_(node['users']))).scalar()
                 if available!=len(node['users']):return {'error':'指定审核人已不可用'},400
-            elif not s.execute(select(User.id).where(User.role==node['role'],User.enabled==1,User.id!=r.author).limit(1)).first():return {'error':'尚未创建可用的'+node['label']+'账号'},400
+            elif not s.execute(select(User.id).where(User.role==node['role'],User.enabled==1,func.coalesce(User.status,1)==1,User.id!=r.author).limit(1)).first():return {'error':'尚未创建可用的'+node['label']+'账号'},400
         ws={'index':0,'approvals':[]};target=cfg['workflow'][0]['label']
     elif action=='退回':
         if not note:raise ValueError('退回原因必填')

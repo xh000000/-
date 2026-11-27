@@ -47,7 +47,7 @@
         <text x="50" y="198" font-size="10" fill="#909399">{{ chart.first }}</text>
         <text x="466" y="198" font-size="10" fill="#909399">{{ chart.last }}</text>
       </svg>
-      <el-table v-else-if="block.type === 'table' && block.data && block.data.length" :data="block.data.slice(-12)" size="small" border>
+      <el-table v-else-if="block.type === 'table' && block.data && block.data.length" :data="block.data.slice(-12)" size="small">
         <el-table-column prop="date" label="日期" width="120" />
         <el-table-column prop="value" :label="block.indicator" />
         <el-table-column prop="unit" label="单位" width="100" />

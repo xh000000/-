@@ -20,13 +20,13 @@
           :default-openeds="[]"
           background-color="#304156"
           text-color="#bfcbd9"
-          active-text-color="#409EFF"
+          active-text-color="#ffffff"
           router
         >
           <template v-for="group in visibleMenu" :key="group.label">
             <el-sub-menu v-if="group.children" :index="'g:' + group.label" :disabled="group.disabled">
               <template #title>
-                <el-icon><component :is="group.icon" /></el-icon>
+                <el-icon><component :is="iconOf(group.icon)" /></el-icon>
                 <span>{{ group.label }}</span>
               </template>
               <el-menu-item
@@ -39,7 +39,7 @@
               </el-menu-item>
             </el-sub-menu>
             <el-menu-item v-else :index="group.path || 'x:' + group.label" :disabled="group.disabled">
-              <el-icon><component :is="group.icon" /></el-icon>
+              <el-icon><component :is="iconOf(group.icon)" /></el-icon>
               <span>{{ group.label }}</span>
             </el-menu-item>
           </template>
@@ -48,23 +48,16 @@
       <div class="app-aside-foot">
         <b>{{ user.name }} · {{ roleName }}</b>
         <span class="foot-note">私有化部署 · 数据留痕</span>
+        <span class="foot-note build-stamp">UI 构建号 1175</span>
       </div>
     </el-aside>
 
     <el-container class="app-body">
-      <TabsBar />
-      <el-header class="app-header" height="56px">
-        <div class="crumb">
-          <template v-for="(part, index) in crumbs" :key="part">
-            <span v-if="index" class="sep">/</span>
-            <b v-if="index === crumbs.length - 1">{{ part }}</b>
-            <span v-else>{{ part }}</span>
-          </template>
-        </div>
-        <div class="tools">
+      <TabsBar>
+        <template #tools>
           <AccountMenu @password="passwordVisible = true" @logout="onLogout" />
-        </div>
-      </el-header>
+        </template>
+      </TabsBar>
       <el-main class="app-main">
         <router-view v-slot="{ Component }">
           <component :is="Component" />
@@ -77,12 +70,13 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, onUnmounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { MENU, breadcrumb, filterMenu } from '../utils/menu';
+import { iconOf } from '../utils/menu';
 import { ROLE_NAMES } from '../utils/format';
 import { logout, user, session } from '../store/session';
+import { onLiveExpire, startLive, stopLive } from '../store/live';
 import ChangePasswordDialog from '../components/ChangePasswordDialog.vue';
 import AccountMenu from '../components/AccountMenu.vue';
 import TabsBar from '../components/TabsBar.vue';
@@ -92,12 +86,23 @@ const router = useRouter();
 const passwordVisible = ref(false);
 
 const roleName = computed(() => ROLE_NAMES[user.value.role] || user.value.role || '');
-const crumbs = computed(() => breadcrumb(route.path));
 
-/* 全局显示开关叠加账号权限；系统设置及其全部子菜单仅管理员可见。 */
-const visibleMenu = computed(() => filterMenu(MENU, user.value, session.data?.menu_visibility || {}));
+/* 菜单目录由后端菜单表按「显示开关 + 权限」过滤后随 /api/state 下发，这里只渲染。 */
+const visibleMenu = computed(() => session.data?.menus || []);
 
 /* 菜单分组默认收起，由用户按需点击展开。 */
+
+/* 登录后保持一条 SSE 长连接：任何写操作都会推进服务端版本号，收到就重新拉快照，
+   菜单显示、研报状态、审批节点这些「以前要刷新才变」的内容会自动跟上。 */
+startLive();
+const offExpire = onLiveExpire(() => {
+  ElMessage.warning('登录状态已失效，请重新登录');
+  router.replace({ name: 'login' });
+});
+onUnmounted(() => {
+  offExpire();
+  stopLive();
+});
 
 async function onLogout() {
   try {

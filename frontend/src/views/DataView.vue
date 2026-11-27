@@ -1,22 +1,20 @@
 <template>
   <div class="data-entry-page">
-    <PageHead
-      title="数据录入"
-      description="管理数据源，配置接口、账号凭据和同步计划，也可通过 CSV 导入数据。"
-    >
-      <el-button v-if="canConfig" type="primary" @click="openSource(null)">新增数据源</el-button>
-      <el-button @click="openCsv">导入 CSV</el-button>
-      <el-button @click="openSyncRecords">同步记录</el-button>
-      <el-button :loading="loading" @click="load">刷新</el-button>
-    </PageHead>
+    <PageContainer title="数据录入">
+      <template #actions>
+        <el-button v-if="canConfig" type="primary" @click="openSource(null)">新增数据源</el-button>
+        <el-button @click="openCsv">导入 CSV</el-button>
+        <el-button @click="openSyncRecords">同步记录</el-button>
+        <el-button :loading="loading" @click="load">刷新</el-button>
+      </template>
 
     <div class="entry-section-head">
-      <div><h3>数据源管理</h3><p class="caption">每个数据源一张卡：状态、巡检健康（近 30 天成功率）、数据规模与同步入口</p></div>
+      <h3>数据源管理</h3>
       <span class="hint entry-meta">{{ sources.filter(item => item.enabled).length }}/{{ sources.length }} 启用 · {{ configs.length }} 项同步配置 · 累计 {{ totalRows.toLocaleString() }} 数据点</span>
     </div>
     <div class="card-grid src-grid">
       <div v-for="source in sources" :key="source.key" class="panel src-card" :class="{ 'source-clickable': canConfig }" @click="canConfig && openSourceSettings(source)">
-        <button v-if="canConfig" class="source-config-link" type="button" @click.stop="openSourceSettings(source)" :aria-label="`配置${source.name}`">查看配置 →</button>
+        <button v-if="canConfig" class="source-config-link" type="button" @click.stop="openSourceSettings(source)" :aria-label="`配置${source.name}`">配置</button>
         <div class="src-head">
           <div>
             <div class="source-identity"><span class="source-avatar">{{ source.name?.slice(0, 1) }}</span><h3>{{ source.name }}</h3></div>
@@ -45,7 +43,7 @@
         </div>
         <p class="caption src-channel">{{ source.channel || '未填写取数通道说明' }}</p>
         <div class="source-actions">
-          <el-button type="primary" size="small" :disabled="!canSync || !source.enabled || syncingSource === source.key" :loading="syncingSource === source.key" @click.stop="openSync(source)">
+          <el-button size="small" :disabled="!canSync || !source.enabled || syncingSource === source.key" :loading="syncingSource === source.key" @click.stop="openSync(source)">
             {{ sourceHasConfig(source) ? '同步数据' : '登记同步' }}
           </el-button>
           </div><div class="source-last-sync">上次同步 <span>{{ localTime(source.last_sync) }}</span>
@@ -56,7 +54,6 @@
 
     <el-dialog v-model="syncRecordsVisible" title="同步记录" width="1200px" top="6vh" class="sync-records-dialog">
       <div class="panel-header">
-        <span class="caption">查看数据同步结果，支持按来源、状态和时间筛选</span>
         <span class="hint">共 {{ jobTotal }} 条</span>
       </div>
 
@@ -144,11 +141,10 @@
     </el-dialog>
 
     <el-drawer v-model="sourceSettingsVisible" :title="`${settingsSource?.name || ''} · 数据源配置`" size="90%">
-      <div class="panel-header"><p class="caption">管理此数据源的接口连接和同步计划</p><el-button @click="openSource(settingsSource)">编辑数据源</el-button></div>
+      <div class="panel-toolbar"><el-button @click="openSource(settingsSource)">编辑数据源</el-button></div>
       <div class="panel-header">
-        <div><h3>接口与同步配置</h3><p class="caption">管理连接凭据、取数范围和执行计划</p></div>
+        <h3>接口与同步配置</h3>
         <div class="row">
-          <span class="hint">支持手动、每日或每周执行</span>
           <el-button type="primary" size="small" @click="openConfig(null, settingsSource)">新建配置</el-button>
         </div>
       </div>
@@ -206,14 +202,9 @@
           </template>
         </el-table-column>
       </el-table>
-      <p class="caption" style="margin-top: 10px">
-        凭据只保存在服务端数据库，接口只回传掩码；执行结果可通过顶部「同步记录」查看，失败原因也一并记录。
-      </p>
     </el-drawer>
 
     <el-dialog v-model="syncVisible" :title="`${activeSource?.name || ''} · ${syncMode === 'register' ? '登记同步' : '同步数据'}`" width="560px" @closed="resetSync">
-      <el-alert v-if="syncMode === 'run'" type="info" :closable="false" show-icon title="立即连接数据接口，按所选配置获取并入库；不会仅登记待执行任务。" />
-      <el-alert v-else type="info" :closable="false" show-icon title="此来源的凭据由已授权通道持有，页面登记同步范围后即可执行；结果见「同步记录」。" />
       <el-form label-width="90px" style="margin-top: 20px">
         <template v-if="syncMode === 'run'">
           <el-form-item label="同步配置">
@@ -240,7 +231,6 @@
         </template>
       </el-form>
       <p v-if="syncMode === 'run' && selectedSyncConfig" class="caption">范围：{{ configScope(selectedSyncConfig) }}</p>
-      <p v-else-if="syncMode === 'register'" class="caption">登记后作业进入「待执行」，由已授权通道取数回填，可在「同步记录」查看进度。</p>
       <template #footer>
         <el-button @click="syncVisible = false">取消</el-button>
         <el-button v-if="syncMode === 'run'" type="primary" :loading="submitting" :disabled="!syncConfigId" @click="submitSync">立即同步</el-button>
@@ -249,10 +239,7 @@
     </el-dialog>
 
     <el-dialog v-model="csvVisible" title="导入 CSV" width="520px" @closed="resetCsv">
-      <p class="caption">
-        UTF-8 CSV，表头 source,indicator,date,value,unit；日期 YYYY-MM-DD，数值为有限数字，
-        整批校验失败不入库。
-      </p>
+      <p class="caption">UTF-8 CSV，表头 source,indicator,date,value,unit；日期 YYYY-MM-DD。</p>
       <div class="csv-pick" @click="fileInput?.click()">
         <el-button @click.stop="fileInput?.click()">选择文件</el-button>
         <span v-if="fileName" class="caption ellipsis" :title="fileName">{{ fileName }}</span>
@@ -493,6 +480,7 @@
         </template>
       </div>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
@@ -500,7 +488,7 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { useRouter } from 'vue-router';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { commodities, refresh } from '../store/session';
 import { localTime } from '../utils/format';
@@ -1085,48 +1073,77 @@ onMounted(load);
 
 <style scoped>
 .sync-records-dialog { max-width: calc(100vw - 32px); }
-.data-entry-page { --entry-border: #e6ebf2; }
-.entry-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
-.entry-section-head h3 { margin: 0 0 6px; font-size: 16px; }
+.data-entry-page { --entry-border: var(--line); }
+.entry-section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.entry-section-head h3 { margin: 0; font-size: 13.5px; }
 .entry-meta { white-space: nowrap; }
-.src-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; margin-bottom: 28px; }
-.src-card { border: 1px solid var(--entry-border); border-radius: 12px; padding: 20px; transition: box-shadow .2s, border-color .2s; }
+.src-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.src-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; transition: border-color .15s; }
 .source-clickable { cursor: pointer; }
-.source-config-link { align-self: flex-end; border: 0; background: none; color: #3265b0; cursor: pointer; font: inherit; font-size: 12px; margin-bottom: 12px; }
-.source-clickable:focus-within { outline: 2px solid #b9cdee; outline-offset: 2px; }
-.src-card:hover { border-color: #b9cdee; box-shadow: 0 6px 22px #1831530a; }
-.source-identity { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.source-avatar { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; color: #3265b0; background: #edf3ff; font-size: 16px; font-weight: 600; }
-.src-health { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; padding: 7px 12px; border-radius: 8px; background: #f8fafc; color: #64748b; font-size: 12px; }
-.src-health b { color: #1f2937; font-weight: 600; }
-.src-health.health-红 { background: #fdf1f1; }
-.src-health.health-黄 { background: #fdf6ec; }
-.src-health.health-绿 { background: #f0f9f4; }
-.src-facts { display: grid; grid-template-columns: 1fr 1fr; padding: 14px 0; margin: 8px 0; border-top: 1px solid #f0f3f8; border-bottom: 1px solid #f0f3f8; }
+.source-config-link {
+  align-self: flex-end; margin-bottom: 10px;
+  border: 0; background: none; padding: 0;
+  color: var(--ink-3); cursor: pointer; font: inherit; font-size: 12px;
+}
+.source-config-link:hover { color: var(--accent); }
+.source-clickable:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.src-card:hover { border-color: var(--accent-line); }
+.source-identity { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+/* 来源标识统一成同一块灰底方块：六个不同底色会跟状态色抢注意力 */
+.source-avatar {
+  display: grid; place-items: center;
+  width: 26px; height: 26px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f4f7f8;
+  color: var(--ink-1);
+  font-size: 13px; font-weight: 600;
+}
+.src-health {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px;
+  margin: 10px 0 2px; padding: 0 0 0 9px;
+  border-left: 2px solid var(--line);
+  color: var(--ink-2); font-size: 12px;
+}
+.src-health b { color: var(--ink-1); font-weight: 600; font-variant-numeric: tabular-nums; }
+.src-health.health-红 { border-left-color: var(--up); }
+.src-health.health-黄 { border-left-color: var(--warn); }
+.src-health.health-绿 { border-left-color: var(--down); }
+.src-facts {
+  display: grid; grid-template-columns: 1fr 1fr;
+  padding: 12px 0; margin: 12px 0;
+  border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2);
+  font-size: 12px; color: var(--ink-3);
+}
+.src-facts b { display: block; margin-top: 1px; font-size: 15px; font-weight: 600; color: var(--ink-1); }
 .src-facts span:last-child { grid-column: 1 / -1; }
-.source-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.source-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .source-actions :deep(.el-button + .el-button) { margin-left: 0; }
-.source-last-sync { display: flex; justify-content: space-between; gap: 8px; margin-top: 16px; color: #94a3b8; font-size: 12px; }
-.src-add { flex-direction: column; min-height: 250px; border-radius: 12px; background: #f8faff; gap: 12px; }
-.src-add > span { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; background: #eaf1fc; color: #4775b8; font-size: 28px; }
-.src-add b { font-size: 14px; font-weight: 500; }
-.src-add small { color: #94a3b8; }
-.data-entry-page > .panel { padding: 22px; border-radius: 12px; border: 1px solid var(--entry-border); margin-bottom: 22px; }
-.job-filter { padding: 14px; border-radius: 8px; background: #f8fafc; display: flex; flex-wrap: wrap; gap: 10px; }
-:deep(.el-table th.el-table__cell) { background: #f8fafc; color: #64748b; }
-:deep(.el-table .el-table__cell) { padding-top: 13px; padding-bottom: 13px; }
-:deep(.page-head) { align-items: flex-start; gap: 20px; margin-bottom: 24px; }
+.source-last-sync { display: flex; justify-content: space-between; gap: 8px; margin-top: 14px; color: var(--ink-3); font-size: 11.5px; }
+.src-add { flex-direction: column; min-height: 220px; border-radius: var(--radius); background: var(--surface); border-style: dashed; gap: 10px; }
+.src-add > span {
+  display: grid; place-items: center;
+  width: 34px; height: 34px; border-radius: var(--radius);
+  background: var(--accent-soft); color: var(--accent);
+  font-size: 22px; line-height: 1;
+}
+.src-add b { font-size: 13px; font-weight: 500; }
+.src-add small { color: var(--ink-3); }
+.data-entry-page > .panel { padding: 18px 20px; border-radius: var(--radius); border: 1px solid var(--line); margin-bottom: 16px; }
+.job-filter { padding: 10px 12px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px; }
+:deep(.el-table .el-table__cell) { padding-top: 9px; padding-bottom: 9px; }
+:deep(.page-head) { align-items: flex-start; gap: 20px; margin-bottom: 16px; }
 :deep(.page-head > .row) { flex-wrap: wrap; justify-content: flex-end; }
 @media (max-width: 1100px) { :deep(.page-head) { flex-wrap: wrap; } }
 @media (max-width: 600px) { .src-grid { grid-template-columns: minmax(0, 1fr); } .data-entry-page > .panel { padding: 14px; } :deep(.el-dialog) { max-width: calc(100vw - 24px); } .entry-meta { display: none; } }
 
 /* 内联巡检状态点 */
-.health-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-.health-dot.dot-绿 { background: #3fb27f; }
-.health-dot.dot-黄 { background: #e6a23c; }
-.health-dot.dot-红 { background: #e35d5d; }
-.stale-warn { color: #e6a23c !important; }
-.stale-tag { color: #94a3b8; font-size: 12px; }
+.health-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+.health-dot.dot-绿 { background: var(--down); }
+.health-dot.dot-黄 { background: var(--warn); }
+.health-dot.dot-红 { background: var(--up); }
+.stale-warn { color: var(--warn) !important; }
+.stale-tag { color: var(--ink-3); font-size: 12px; }
 .stale-tag.stale-warn { font-weight: 600; }
-.troubleshoot-list { margin: 6px 0 0 18px; padding: 0; color: #475569; font-size: 13px; line-height: 1.9; }
+.troubleshoot-list { margin: 6px 0 0 18px; padding: 0; color: var(--ink-2); font-size: 13px; line-height: 1.9; }
 </style>

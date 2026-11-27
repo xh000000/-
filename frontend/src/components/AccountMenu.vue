@@ -32,14 +32,34 @@ const initial = computed(() => String(user.value.name || '研').slice(0, 1));
 function act(action) { visible.value = false; emit(action); }
 </script>
 <style scoped>
-.account-trigger { border: 0; background: transparent; font: inherit; cursor: pointer; border-radius: 6px; padding: 5px 8px; }
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.user-chip i {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.user-chip em { font-style: normal; font-size: 11.5px; color: var(--ink-3); }
+.account-trigger { border: 0; background: transparent; font: inherit; cursor: pointer; border-radius: var(--radius); padding: 3px 6px; }
 .account-trigger:hover { background: var(--el-fill-color-light); }
-.account-trigger:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; }
+.account-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .account-panel { padding: 6px; }
 .account-panel h3 { margin: 0 0 16px; font-size: 15px; }
 .account-panel dl { margin: 0; }
 .account-panel dl > div { display: flex; gap: 16px; margin-bottom: 12px; font-size: 13px; }
-.account-panel dt { width: 42px; flex-shrink: 0; color: var(--el-text-color-secondary); }
-.account-panel dd { margin: 0; color: var(--el-text-color-primary); overflow-wrap: anywhere; }
-.account-actions { display: flex; border-top: 1px solid var(--el-border-color-lighter); padding-top: 14px; margin-top: 16px; }
+.account-panel dt { width: 42px; flex-shrink: 0; color: var(--ink-3); }
+.account-panel dd { margin: 0; color: var(--ink-1); overflow-wrap: anywhere; }
+.account-actions { display: flex; border-top: 1px solid var(--line-2); padding-top: 14px; margin-top: 16px; }
 </style>

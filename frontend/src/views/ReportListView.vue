@@ -1,8 +1,9 @@
 <template>
   <div>
-    <PageHead title="研报中心" description="按「我的 / 共享 / 公共」查看研报；状态口径为待提交 → 待审批 → 已通过 → 已发布，驳回后回到可编辑状态。">
-      <el-button type="primary" :disabled="!canCreate" @click="dialogVisible = true"><el-icon style="margin-right:6px"><DocumentAdd /></el-icon>新建研报</el-button>
-    </PageHead>
+    <PageContainer title="研报中心">
+      <template #actions>
+        <el-button type="primary" :disabled="!canCreate" @click="dialogVisible = true"><el-icon style="margin-right:6px"><DocumentAdd /></el-icon>新建研报</el-button>
+      </template>
 
     <div class="filter-bar">
       <el-input v-model="filters.search" placeholder="搜索标题 / 创建人" clearable />
@@ -34,11 +35,12 @@
         <el-tab-pane label="共享研报" name="shared" />
         <el-tab-pane label="公共研报" name="public" />
       </el-tabs>
-      <ReportTable :reports="list" @open="openReport" @more="openMore" />
+      <ReportTable :reports="list" @open="openReport" @edit="editReport" @more="openMore" />
     </div>
 
     <NewReportDialog v-model="dialogVisible" @created="createdReport" />
-    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" />
+    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" @edit="editReport" />
+    </PageContainer>
   </div>
 </template>
 
@@ -47,7 +49,7 @@ import { computed, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { createdReportRoute } from '../utils/reportCreation';
 import { DocumentAdd } from '@element-plus/icons-vue';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import ReportTable from '../components/ReportTable.vue';
 import NewReportDialog from '../components/NewReportDialog.vue';
 import ReportActionDialog from '../components/ReportActionDialog.vue';
@@ -118,7 +120,9 @@ function resetFilters() {
   filters.sort = 'status';
 }
 
-const openReport = id => router.push({ name: 'editor', params: { id } });
+/* 列表点标题 / 「查看」进只读详情；只有明确点「编辑」才进编辑态。 */
+const openReport = id => router.push({ name: 'editor', params: { id }, query: { mode: 'view' } });
+const editReport = id => router.push({ name: 'editor', params: { id } });
 
 function openMore(id) {
   moreId.value = id;

@@ -1,8 +1,9 @@
 <template>
   <div>
-    <PageHead title="作者管理" description="署名作者用于研报版头与合规留痕；停用后不能再被选为署名，历史报告不受影响。">
-      <el-button type="primary" @click="openDialog(null)">添加作者</el-button>
-    </PageHead>
+    <PageContainer title="作者管理">
+      <template #actions>
+        <el-button type="primary" @click="openDialog(null)">添加作者</el-button>
+      </template>
 
     <div class="panel">
       <el-table :data="authors" empty-text="暂无作者">
@@ -30,9 +31,10 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="110">
+        <el-table-column label="操作" width="150">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openDialog(row)">编辑</el-button>
+            <el-button link type="danger" size="small" :loading="removing === row.id" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -55,26 +57,30 @@
           <el-switch v-model="form.enabled" />
         </el-form-item>
       </el-form>
-      <p class="caption">至少选择一种报告类型；名称不可与已有作者重复。</p>
       <template #footer>
         <el-button @click="visible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="save">保存</el-button>
       </template>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { reactive, ref } from 'vue';
-import { ElMessage } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { authors, refresh } from '../store/session';
 import { parseJSON } from '../utils/format';
 
 const TYPE_OPTIONS = ['日报', '周报', '专题', '调研纪要'];
 
+/* 后端校验文案本身是完整句子，去掉框架统一加的「输入无效：」前缀更好读 */
+const plain = message => String(message || '').replace(/^输入无效：/, '');
+
 const busy = ref(false);
+const removing = ref(null);
 const visible = ref(false);
 const form = reactive({ id: null, name: '', license: '', types: [...TYPE_OPTIONS], enabled: true });
 
@@ -111,9 +117,31 @@ async function save() {
     visible.value = false;
     ElMessage.success('作者已保存');
   } catch (error) {
-    ElMessage.error(error.message || '保存失败');
+    ElMessage.error(plain(error.message) || '保存失败');
   } finally {
     busy.value = false;
+  }
+}
+
+async function remove(row) {
+  try {
+    await ElMessageBox.confirm(
+      `删除后该作者不再出现在列表与新建研报的署名选项里，历史研报的署名不受影响。确定删除「${row.name}」？`,
+      '删除作者',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    );
+  } catch {
+    return;
+  }
+  removing.value = row.id;
+  try {
+    await api('catalog', { action: 'delete', kind: 'authors', id: row.id });
+    await refresh();
+    ElMessage.success('作者已删除');
+  } catch (error) {
+    ElMessage.error(plain(error.message) || '删除失败');
+  } finally {
+    removing.value = null;
   }
 }
 </script>

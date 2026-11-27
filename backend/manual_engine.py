@@ -3,10 +3,10 @@
 数据访问一律走 ORM：``s`` 是 SQLAlchemy Session，查询用 select()，写入用对象赋值。
 """
 import json,re,datetime
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, func, select, text, update
 import db
 import report_engine as e
-from db import Author, Category, CategoryMigration, Commodity, ConfigEvent, Event, Report, User, Version
+from db import ApprovalFlow, Author, Category, CategoryMigration, Commodity, ConfigEvent, Event, Report, User, Version
 
 def add_columns(s,table,columns):
     db.add_columns(s,table,columns)
@@ -16,7 +16,7 @@ def migrate(s):
     add_columns(s,'categories',{'parent_id':'INTEGER','label':"TEXT DEFAULT ''",'sort_order':'INTEGER DEFAULT 0','folder':'INTEGER DEFAULT 0'})
     add_columns(s,'reports',{'metadata':"TEXT DEFAULT ''"})
     add_columns(s,'versions',{'metadata':"TEXT DEFAULT ''"})
-    add_columns(s,'authors',{'license':"TEXT DEFAULT ''"})
+    add_columns(s,'authors',{'license':"TEXT DEFAULT ''",'status':'INTEGER DEFAULT 1'})
     if not db.has_flag(s,'manual-v1'):
         for cat in s.execute(select(Category).order_by(Category.id)).scalars().all():
             original=cat.name
@@ -247,7 +247,7 @@ def tree(s):
     return rows
 
 def catalogs(s):
-    return {'category_tree':tree(s),'authors':[x.to_dict() for x in s.execute(select(Author).order_by(Author.id)).scalars()],'commodities':[x.to_dict() for x in s.execute(select(Commodity).order_by(Commodity.id)).scalars()],'members':[dict(r._mapping) for r in s.execute(select(User.id,User.name,User.role,User.enabled).order_by(User.id))]}
+    return {'category_tree':tree(s),'authors':[x.to_dict() for x in s.execute(select(Author).where(func.coalesce(Author.status,1)==1).order_by(Author.id)).scalars()],'commodities':[x.to_dict() for x in s.execute(select(Commodity).order_by(Commodity.id)).scalars()],'members':[dict(r._mapping) for r in s.execute(select(User.id,User.name,User.role,User.enabled).where(func.coalesce(User.status,1)==1).order_by(User.id))]}
 
 
 def commodity_usage(s,cid):
@@ -267,6 +267,33 @@ def commodity_usage(s,cid):
                for section in config.get('sections') or []):
             count+=1
     return count
+
+
+def _released_author_name(s,name,aid):
+    """软删除后腾出唯一姓名，避免以后加同名作者撞唯一约束。
+
+    行要留着（署名快照、审计都对得上），只能改名：后缀「（已删除）」，撞名再拼 id。
+    """
+    base=name if name.endswith('（已删除）') else name+'（已删除）'
+    candidate=base[:191]
+    if s.execute(select(Author.id).where(Author.name==candidate)).first() is None:
+        return candidate
+    return (base[:180]+'#'+str(aid))[:191]
+
+
+def delete_author(s,aid):
+    """删除作者（逻辑删除）：状态置 0、行保留。
+
+    历史研报的署名是创建时拍下的快照（姓名与资格证号都在 metadata 里），
+    所以删掉作者不会让旧报告署名指向空处，也不需要拦住「已署名」的作者。
+    """
+    row=s.get(Author,aid)
+    if not row:raise ValueError('作者不存在')
+    original=row.name
+    row.status=0;row.enabled=0
+    row.name=_released_author_name(s,original,aid)
+    s.flush()
+    return {'ok':True,'id':aid,'name':original}
 
 
 def delete_commodity(s,cid):
@@ -354,13 +381,40 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         if not source or not can_view(s,source,u):return {'error':'无权继承此报告'},403
     if path in ['/api/catalog','/api/category-tree']:
         if u['role']!='admin':return {'error':'仅管理员可管理基础资料'},403
+        if path=='/api/category-tree' and str(d.get('action') or '')=='delete':
+            """删除分类：先挡住会丢数据的三种情况（子分类、已有研报、被审批流引用），再删。
+
+            分类本身没有外键约束，所以顺手清掉 migration 映射；配置事件保留下来
+            当作审计痕迹（category_id 悬空不影响任何读取路径）。
+            """
+            try:rid=int(d.get('id') or 0)
+            except (TypeError,ValueError):raise ValueError('缺少要删除的分类')
+            row=s.get(Category,rid)
+            if not row:raise ValueError('分类不存在')
+            children=s.execute(select(Category.id).where(Category.parent_id==rid)).scalars().all()
+            if children:raise ValueError('该分类下还有 %d 个子分类，请先删除子分类'%len(children))
+            used=s.execute(select(Report.id).where(Report.category_id==rid,Report.deleted==0)).scalars().all()
+            if used:raise ValueError('该分类下已有 %d 篇研报，不能删除；不再使用时请改为停用'%len(used))
+            flow_names=[]
+            for flow in s.execute(select(ApprovalFlow)).scalars():
+                try:ids=json.loads(flow.category_ids or '[]')
+                except (TypeError,ValueError):ids=[]
+                if rid in ids:flow_names.append(flow.name or '未命名流程')
+            if flow_names:raise ValueError('该分类已被审批流「%s」引用，请先在审批流设置里移除'%flow_names[0])
+            label,name,parent,revision=row.label,row.name,row.parent_id,row.revision
+            s.execute(delete(CategoryMigration).where(CategoryMigration.category_id==rid))
+            s.add(ConfigEvent(category_id=rid,actor=u['name'],config=e.dump({'tree_delete':{'label':label,'name':name,'parent_id':parent}}),revision=revision,at=stamp()))
+            s.delete(row)
+            return {'ok':True},200
         if path=='/api/catalog':
             if str(d.get('action') or '')=='delete':
-                if d.get('kind')!='commodities':raise ValueError('该资料类型不支持删除')
+                kind=str(d.get('kind') or '')
+                if kind not in ['commodities','authors']:raise ValueError('该资料类型不支持删除')
+                label='品种' if kind=='commodities' else '作者'
                 try:rid=int(d.get('id') or 0)
-                except (TypeError,ValueError):raise ValueError('缺少要删除的品种')
-                if not rid:raise ValueError('缺少要删除的品种')
-                return delete_commodity(s,rid),200
+                except (TypeError,ValueError):raise ValueError('缺少要删除的%s'%label)
+                if not rid:raise ValueError('缺少要删除的%s'%label)
+                return (delete_commodity(s,rid) if kind=='commodities' else delete_author(s,rid)),200
             kind=d['kind'];name=e.text(d['name'],80).strip();enabled=int(bool(d.get('enabled',True)));rid=int(d['id']) if d.get('id') else None
             if not name or kind not in ['authors','commodities']:raise ValueError('资料类型或名称无效')
             if kind=='authors':
@@ -476,7 +530,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         nodes={x['id']:x for x in tree(s)};node=nodes.get(int(d.get('category_id') or 0))
         if not node or node['folder'] or not node['effective_enabled']:return {'error':'请选择已启用的末级分类'},400
         by=s.get(Author,int(d.get('byline_id') or 0))
-        if by and not by.enabled:by=None
+        if by and (not by.enabled or by.status==0):by=None
         cat=s.get(Category,node['id']);cfg=json.loads(cat.config)
         if not by or cfg['kind'] not in json.loads(by.types):raise ValueError('署名作者未启用或不适用于该报告类型')
         commodity=s.execute(select(Commodity).where(Commodity.name==d.get('commodity',''),Commodity.enabled==1)).scalars().first()
@@ -491,7 +545,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         if collaboration=='personal':collaborators=[]
         for person in collaborators:
             row=s.get(User,person)
-            if not row or not row.enabled or row.role not in ['researcher','admin']:raise ValueError('协作人必须为已启用的研究员或管理员')
+            if not row or not row.enabled or row.status==0 or row.role not in ['researcher','admin']:raise ValueError('协作人必须为已启用的研究员或管理员')
         date=e.text(d.get('report_date',''),10);datetime.date.fromisoformat(date)
         layout=d.get('layout',cfg['layout'])
         if layout not in ['flow','grid','free']:raise ValueError('布局无效')
@@ -571,7 +625,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
         m['summary']=e.text(d.get('summary',m['summary']),2000);m['public']=bool(d.get('public',m['public']))
         if 'byline_id' in d and int(d['byline_id'])!=m['byline_id']:
             by=s.get(Author,int(d['byline_id']))
-            if by and not by.enabled:by=None
+            if by and (not by.enabled or by.status==0):by=None
             if not by or r['kind'] not in json.loads(by.types):raise ValueError('署名作者不可用或不适用于本报告类型')
             m.update(byline_id=by.id,byline=by.name,byline_license=by.license or '')
         if 'report_date' in d:
@@ -596,7 +650,7 @@ def handle(s,path,d,u,stamp,snapshot,event,checks):
                 if not set(editors)<=set([r['author']]+m['collaborators']):raise ValueError('编辑人必须为创建人或协作人')
                 for uid in editors:
                     person=s.get(User,uid)
-                    if not person or not person.enabled or person.role not in ['admin','researcher']:raise ValueError('编辑人必须为启用的管理员或研究员')
+                    if not person or not person.enabled or person.status==0 or person.role not in ['admin','researcher']:raise ValueError('编辑人必须为启用的管理员或研究员')
                 target=current[sid]
                 if set(editors)==set(target.get('editors',[])):continue
                 if target.get('state')=='已提交':return {'error':'已提交章节须先撤销提交后再调整分工'},400

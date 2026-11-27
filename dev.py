@@ -51,6 +51,20 @@ MIME = {
 
 HOP = {'host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive', 'accept-encoding'}
 
+# 需要逐块转发的端点（SSE）。普通 proxy() 会 read() 到底再回写，事件会被一直攒住，
+# 前端表现就是「连上了但永远收不到推送」。
+STREAM_PATHS = {'/api/events'}
+
+
+class DevServer(http.server.ThreadingHTTPServer):
+    """页面 + 代理服务。
+
+    request_queue_size 调大：SSE 长连接会一直占着处理线程，页面刷新时十几个静态资源
+    又是一起砸进来的，默认 backlog 5 太小，浏览器会眼睁睁看着请求被拒再重试。
+    """
+    daemon_threads = True
+    request_queue_size = 128
+
 
 class DevHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -114,8 +128,64 @@ class DevHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def stream(self):
+        """流式转发（SSE）：读到多少就写多少，绝不攒到响应结束。"""
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        headers['Host'] = self.headers.get('Host', '')
+        headers['X-Forwarded-For'] = self.client_address[0]
+        headers['X-Forwarded-Proto'] = 'http'
+        request = urllib.request.Request(API_BASE + self.path, headers=headers, method='GET')
+        try:
+            upstream = urllib.request.urlopen(request, timeout=None)
+        except urllib.error.HTTPError as error:
+            payload = error.read()
+            self.send_response(error.code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        except urllib.error.URLError as error:
+            payload = ('{"error":"后端未启动：%s"}' % error.reason).encode()
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.send_response(upstream.status)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-transform')
+        self.send_header('X-Accel-Buffering', 'no')
+        # 长度未知，用 chunked 才能边读边发；写失败说明浏览器已断开，静默收尾
+        self.send_header('Transfer-Encoding', 'chunked')
+        self.end_headers()
+        self.close_connection = True
+        read = getattr(upstream, 'read1', upstream.read)
+        try:
+            while True:
+                chunk = read(2048)
+                if not chunk:
+                    break
+                self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 浏览器关标签页/刷新时常见：Windows 抛 ConnectionAborted，Linux 抛 BrokenPipe
+            pass
+        except OSError:
+            pass
+        finally:
+            upstream.close()
+            try:
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
+            except Exception:
+                pass
+
     def do_GET(self):
         if self.path.startswith('/api/'):
+            if self.path.split('?')[0] in STREAM_PATHS:
+                return self.stream()
             return self.proxy('GET')
         return self.serve_file()
 
@@ -188,6 +258,6 @@ if __name__ == '__main__':
     print('static:    %s' % ROOT, flush=True)
     print('api proxy: %s' % API_BASE, flush=True)
     try:
-        http.server.ThreadingHTTPServer(('127.0.0.1', port), DevHandler).serve_forever()
+        DevServer(('127.0.0.1', port), DevHandler).serve_forever()
     except KeyboardInterrupt:
         pass

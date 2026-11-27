@@ -39,14 +39,15 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import db as database
 import datasource
-import menu_settings
+import live
+import menu_catalog
 import ai_profiles
 import feeds
 import iam_engine as iam
@@ -79,6 +80,11 @@ def cookie_name() -> str:
 def init() -> None:
     """建表 + 幂等迁移。各 engine 的 migrate 只负责补列与一次性数据迁移。"""
     with SessionFactory() as session:
+        # 菜单目录是独立表，即使其余结构没变也要保证默认目录已写入（旧库升级时靠这里建表 + 写入）
+        database.create_schema()
+        menu_catalog.ensure(session, stamp())
+        live.ensure(session)
+        session.commit()
         # 结构没变就直接返回。远程库（Neon / 云数据库）上整套补列检查有几十次
         # 网络往返，十几秒起步；而绝大多数启动结构根本没变过。
         if database.schema_current(session):
@@ -106,8 +112,7 @@ def init() -> None:
             'result_indicator': "TEXT DEFAULT ''"})
         datasource._ensure_unique_index(session, 'uq_viewpoint_candidate', 'viewpoints', 'candidate_id')
         database.add_columns(session, 'reports', {'scheduled_at': "TEXT DEFAULT ''",
-                                                  'ai_draft': 'INTEGER DEFAULT 0',
-                                                  'ai_summary': "TEXT DEFAULT ''"})
+                                                  'ai_draft': 'INTEGER DEFAULT 0'})
         session.commit()
         # 所有补列都成功落库之后才记账，中途失败下次仍会完整重跑
         database.mark_schema_current(session)
@@ -355,6 +360,13 @@ async def guard(request: Request, call_next):
         if length > 8_000_000:
             return _json({'error': '请求超过8MB'}, 413)
     response = await call_next(request)
+    # 写操作成功落库后推进版本号，在线客户端据此自动刷新（见 /api/events）。
+    # 推进失败绝不能影响业务响应本身，所以吞掉异常。
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and response.status_code < 400:
+        try:
+            await run_in_threadpool(live.bump)
+        except Exception:
+            pass
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     return response
@@ -398,7 +410,7 @@ def resolve_user(session: Session, token: str) -> User | None:
     if not record or not record.expires or record.expires <= time.time():
         return None
     user = session.get(User, record.user_id)
-    if not user or not user.enabled:
+    if not user or not user.enabled or user.status == 0:  # status=0 为逻辑删除的账号
         return None
     now = time.time()
     # 未勾选「保持登录」的会话：30 分钟无操作即失效
@@ -512,6 +524,36 @@ def get_report_print(request: Request, rid: str, session: Session = Depends(get_
     return HTMLResponse(printview.render(row, print_people(session, row)))
 
 
+def _session_alive(token: str) -> bool:
+    """长连接期间的会话存活检查。
+
+    只读、不续期 ``last_seen``：页面挂着 SSE 不等于用户有操作，否则「30 分钟无操作
+    自动登出」就永远触发不了了。
+    """
+    if not token:
+        return False
+    with SessionFactory() as session:
+        record = session.get(SessionRow, token)
+        return bool(record and record.expires and record.expires > time.time())
+
+
+@app.get('/api/events', summary='实时变更事件流（SSE）')
+async def get_events(request: Request, session: Session = Depends(get_db)):
+    """数据一变就推一条版本号，前端收到后重新拉一次 /api/state。
+
+    返回流之前要先关掉依赖注入的 session：这条连接会挂很久，占着连接池不放，
+    同时打开几个页面就能把连接耗干。
+    """
+    context_of(request, session)
+    token = _pick_token(request.cookies)
+    session.close()
+    return StreamingResponse(
+        live.stream(request.is_disconnected, lambda: _session_alive(token)),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no'},
+    )
+
+
 @app.get('/api/state', summary='全量状态快照（前端首屏）')
 def get_state(request: Request, session: Session = Depends(get_db)):
     user = context_of(request, session)['u']
@@ -529,6 +571,11 @@ def get_state(request: Request, session: Session = Depends(get_db)):
             select(Event.id).where(Event.report_id == item['id'], Event.actor == user['name'],
                                    Event.action.in_(['通过', '退回', '发布'])).limit(1)).first() is not None
         item['can_schedule'] = bool(item['status'] == '待发布' and user['role'] in ['publisher', 'admin'])
+        # 「能不能改、为什么不能改、卡在哪个节点」由服务端统一判断，前端不再各自猜状态
+        edit = engine.edit_state(session, item, user)
+        item['can_edit'] = edit['can_edit']
+        item['edit_reason'] = edit['reason']
+        item['current_node'] = edit['node']
         reports.append(item)
     admin = user['role'] == 'admin'
     indicators = session.execute(
@@ -537,13 +584,17 @@ def get_state(request: Request, session: Session = Depends(get_db)):
         .group_by(Observation.source, Observation.indicator, Observation.unit)
         .order_by(Observation.indicator))
     department = session.get(database.Department, user.dept_id) if user.dept_id else None
+    # 菜单树在服务端按「显示开关 + 仅管理员 + 角色权限」过滤后再下发，前端只负责渲染
+    menu_keys = iam.menus_for(session, user)
     return _json({
         **manual.catalogs(session), 'library': library.items(session),
+        'revision': live.current(session),
         'user': {'id': user['id'], 'name': user['name'], 'role': user['role'], 'role_id': user['role_id'],
                  'dept_id': user['dept_id'], 'dept_name': department.name if department else '',
                  'phone': user['phone'], 'title': user['title'],
-                 'menus': iam.menus_for(session, user)},
-        'menu_visibility': menu_settings.read(session)['visibility'],
+                 'menus': menu_keys},
+        'menu_visibility': menu_catalog.hidden_map(session),
+        'menus': menu_catalog.visible_tree(session, user, menu_keys),
         'reports': reports, 'categories': engine.categories(session),
         'indicators': [dict(r._mapping) for r in indicators],
         'data': [x.to_dict() for x in session.execute(
@@ -657,23 +708,7 @@ async def post_ai_test(request: Request, session: Session = Depends(get_db)):
     if user['role'] != 'admin':
         raise ApiError(403, '仅管理员可测试外部模型')
     data = await payload(request)
-    profile_id = data.get('profile_id')
-    if profile_id == 'legacy':
-        selected = _legacy_ai_profile(session)
-    elif profile_id:
-        selected = next((p for p in ai_profiles.read(session)['profiles'] if p['id'] == profile_id), None)
-        if selected is None:
-            raise ApiError(404, '模型配置不存在')
-    elif 'profile_id' not in data:
-        selected = ai_profiles.active(session) or _legacy_ai_profile(session)
-    else:
-        selected = {}
-    base = str(data.get('base_url') or selected.get('base_url') or '').strip().rstrip('/')
-    if base:
-        base = ai_profiles.valid_base(base)
-    key = str(data.get('api_key') or '').strip()
-    if not key and base == selected.get('base_url'):
-        key = selected.get('api_key') or ''
+    base, key = _ai_probe_target(session, data)
     model = str(data.get('model') or '').strip()
     clean = lambda text: str(text).replace(key, '***') if key else str(text)
     started = time.time()
@@ -700,15 +735,39 @@ async def post_ai_test(request: Request, session: Session = Depends(get_db)):
     })
 
 
+@app.post('/api/ai/models', summary='读取上游可用模型列表（不保存、不写库）')
+async def post_ai_models(request: Request, session: Session = Depends(get_db)):
+    """只读上游 /models，不发对话请求：填好地址和密钥后就能挑选模型。"""
+    user = resolve_user(session, _pick_token(request.cookies))
+    if not user:
+        raise ApiError(401, '请先登录')
+    if user['role'] != 'admin':
+        raise ApiError(403, '仅管理员可读取外部模型')
+    data = await payload(request)
+    base, key = _ai_probe_target(session, data)
+    clean = lambda text: str(text).replace(key, '***') if key else str(text)
+    if not key:
+        return _json({'ok': False, 'models': [], 'message': '还没有填写密钥，无法读取模型列表'})
+    models, note = await run_in_threadpool(_upstream_models, base, key)
+    if note:
+        return _json({'ok': False, 'models': [], 'message': clean(note)})
+    _remember_models(base, key, models)
+    if not models:
+        return _json({'ok': True, 'models': [], 'message': '该接口没有返回模型列表，可手动填写模型名称'})
+    return _json({'ok': True, 'models': models, 'message': '已读取 %d 个可用模型' % len(models)})
+
+
 # ---------------------------------------------------------------------------
 # 数据源：同花顺 / Wind 的同步作业与幂等入库
 # ---------------------------------------------------------------------------
-@app.get('/api/system/menus', summary='菜单显示设置（仅管理员）')
+@app.get('/api/system/menus', summary='菜单目录与显示设置（仅管理员）')
 def get_menu_settings(request: Request, session: Session = Depends(get_db)):
     user = context_of(request, session)['u']
     if user.role != 'admin':
         raise ApiError(403, '仅管理员可管理菜单')
-    return _json(menu_settings.read(session))
+    return _json({'revision': menu_catalog.revision(session),
+                  'visibility': menu_catalog.hidden_map(session),
+                  'menus': menu_catalog.tree(session)})
 
 
 @app.post('/api/system/menus', summary='保存菜单显示设置（仅管理员）')
@@ -717,7 +776,7 @@ async def post_menu_settings(request: Request, session: Session = Depends(get_db
     if user.role != 'admin':
         raise ApiError(403, '仅管理员可管理菜单')
     data = await payload(request)
-    result, status = menu_settings.save(session, data, stamp())
+    result, status = menu_catalog.save(session, data, stamp())
     session.commit()
     return _json(result, status)
 
@@ -895,9 +954,10 @@ async def post_scope_group_delete(request: Request, session: Session = Depends(g
         raise ApiError(401, '请先登录')
     _admin(user)
     data = await payload(request)
-    _dict_call(datasource.delete_group, session, data.get('id'))
+    removed = _dict_call(datasource.delete_group, session, data.get('id'),
+                         cascade=bool(data.get('cascade')))
     session.commit()
-    return _json({'ok': True, 'library': datasource.scope_presets(session)})
+    return _json({'ok': True, **(removed or {}), 'library': datasource.scope_presets(session)})
 
 
 
@@ -1214,7 +1274,7 @@ async def post_login(request: Request, session: Session = Depends(get_db)):
     name = str(data.get('name', '')).strip()
     raw = str(data.get('password', ''))
     user = session.execute(select(User).where(User.name == name)).scalars().first()
-    if not user or not user.enabled or not hmac.compare_digest(user.hash or '', password(raw, user.salt or '')):
+    if not user or not user.enabled or user.status == 0 or not hmac.compare_digest(user.hash or '', password(raw, user.salt or '')):
         raise ApiError(401, '账号或密码错误，或账号已停用')
     return login_response(session, user, bool(data.get('remember')))
 
@@ -1523,6 +1583,28 @@ def _ai_model(s: Session) -> str:
     if profile is not None:
         return profile['model']
     return _legacy_ai_profile(s)['model']
+
+
+def _ai_probe_target(session: Session, data: dict) -> tuple[str, str]:
+    """解析测试 / 取模型列表的目标：显式填写的地址密钥优先，其次取已保存配置。"""
+    profile_id = data.get('profile_id')
+    if profile_id == 'legacy':
+        selected = _legacy_ai_profile(session)
+    elif profile_id:
+        selected = next((p for p in ai_profiles.read(session)['profiles'] if p['id'] == profile_id), None)
+        if selected is None:
+            raise ApiError(404, '模型配置不存在')
+    elif 'profile_id' not in data:
+        selected = ai_profiles.active(session) or _legacy_ai_profile(session)
+    else:
+        selected = {}
+    base = str(data.get('base_url') or selected.get('base_url') or '').strip().rstrip('/')
+    if base:
+        base = ai_profiles.valid_base(base)
+    key = str(data.get('api_key') or '').strip()
+    if not key and base == selected.get('base_url'):
+        key = selected.get('api_key') or ''
+    return base, key
 
 
 def _upstream_models(base: str, key: str) -> tuple[list[str], str]:

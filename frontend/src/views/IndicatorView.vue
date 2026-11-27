@@ -1,11 +1,9 @@
 <template>
   <div class="indicator-page">
-    <PageHead
-      title="指标查询"
-      description="按来源与名称检索已入库的指标，查看区间统计、走势与逐日明细；数据来自「数据录入」的同步结果。"
-    >
-      <el-button :loading="loading" @click="load">刷新</el-button>
-    </PageHead>
+    <PageContainer title="指标查询">
+      <template #actions>
+        <el-button :loading="loading" @click="load">刷新</el-button>
+      </template>
 
     <div class="panel ind-filter">
       <div class="row">
@@ -93,8 +91,8 @@
             >
               <defs>
                 <linearGradient :id="gradientId" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#409eff" stop-opacity="0.22" />
-                  <stop offset="100%" stop-color="#409eff" stop-opacity="0" />
+                  <stop offset="0%" stop-color="#409EFF" stop-opacity="0.22" />
+                  <stop offset="100%" stop-color="#409EFF" stop-opacity="0" />
                 </linearGradient>
               </defs>
               <line
@@ -112,7 +110,7 @@
               <path
                 :d="chart.line"
                 fill="none"
-                stroke="#409eff"
+                stroke="#409EFF"
                 stroke-width="1.6"
                 stroke-linejoin="round"
                 stroke-linecap="round"
@@ -164,13 +162,14 @@
         </div>
       </div>
     </div>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 
 const METRIC_LABELS = {

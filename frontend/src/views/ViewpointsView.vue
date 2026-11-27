@@ -1,8 +1,9 @@
 <template>
   <div class="viewpoints-page">
-    <PageHead title="研报观点跟踪">
-      <el-button v-if="user.role === 'admin'" text @click="rulesVisible = true">复盘规则</el-button>
-    </PageHead>
+    <PageContainer title="研报观点跟踪">
+      <template #actions>
+        <el-button v-if="user.role === 'admin'" text @click="rulesVisible = true">复盘规则</el-button>
+      </template>
     <div v-show="activeTab === 'candidates'" class="vp-toolbar">
       <div class="vp-date-field"><span>发布日期</span><el-date-picker v-model="publicationRange" type="daterange" value-format="YYYY-MM-DD" range-separator="—" start-placeholder="开始日期" end-placeholder="结束日期" :clearable="false" :disabled="extracting || loading || aiRunning" @change="load" /></div>
       <div class="vp-extract-actions"><el-select v-model="extractionMethod" aria-label="提取方式" :disabled="extracting || aiRunning" style="width:120px"><el-option label="规则提取" value="rule" /><el-option label="AI 提取" value="ai" /></el-select><el-button type="primary" :loading="extracting || aiRunning" :disabled="loading || !publicationRange?.length" @click="extractByDate">提取研报观点</el-button></div>
@@ -110,7 +111,7 @@
 
     <div v-show="activeTab === 'results'" class="vp-portraits"><p class="vp-stat-note">统计口径：按每条观点确认时锁定的阈值判定；正确率为正确数 / 有效结算数（含持平），无法结算不计入。以下汇总覆盖全部可见观点，不受列表筛选影响。</p>
       <div class="panel vp-portrait">
-        <div class="panel-header"><h3>研究员复盘统计</h3><p class="caption">按观点人统计正确率、样本量与方向分布（仅有效结算观点）</p></div>
+        <div class="panel-header"><h3>研究员复盘统计</h3></div>
         <el-table :data="portraitRows(stats.by_user)" size="small" empty-text="暂无已结算观点">
           <el-table-column label="观点人" prop="name" min-width="90" />
           <el-table-column label="已结算" prop="total" width="76" align="center" />
@@ -130,7 +131,7 @@
         </el-table>
       </div>
       <div class="panel vp-portrait">
-        <div class="panel-header"><h3>品种正确率</h3><p class="caption">按已结算观点统计，各品种样本量不同</p></div>
+        <div class="panel-header"><h3>品种正确率</h3></div>
         <el-table :data="portraitRows(stats.by_commodity)" size="small" empty-text="暂无已结算观点">
           <el-table-column label="品种" prop="name" min-width="90" />
           <el-table-column label="已结算" prop="total" width="76" align="center" />
@@ -183,7 +184,6 @@
       <template #footer><el-button :disabled="saving" @click="confirmVisible = false">取消</el-button><el-button type="primary" :loading="saving" :disabled="!reviewed" @click="confirmSelected">确认并开始跟踪</el-button></template>
     </el-dialog>
     <el-dialog v-model="rulesVisible" title="复盘规则" width="min(740px, 94vw)" :close-on-click-modal="false">
-      <p class="caption">按品种和观察期设置涨跌幅阈值。新确认观点保存规则快照，修改不会影响已有记录；阈值内看多/看空计持平、震荡计正确，达到边界视为有方向变动。</p>
       <div v-for="(rule,index) in ruleDraft.items" :key="index" class="vp-rule-row">
         <el-select v-model="rule.commodity" filterable placeholder="品种"><el-option v-for="name in commodityNames" :key="name" :label="name" :value="name" /></el-select>
         <el-input-number v-model="rule.horizon_days" :min="1" :max="90" aria-label="观察期天数" /><span>天</span>
@@ -193,13 +193,14 @@
       <el-button @click="ruleDraft.items.push({commodity:'',horizon_days:5,threshold:1})">添加规则</el-button>
       <template #footer><el-button :disabled="saving" @click="rulesVisible = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveRules">保存规则</el-button></template>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { useRouter } from 'vue-router';
 import { commodities, user } from '../store/session';
@@ -243,7 +244,7 @@ const ruleDraft = reactive({ revision:0, items:[] });
 const ruleSet = ref([]);
 watch(rulesVisible, visible => { if (!visible) ruleDraft.items = JSON.parse(JSON.stringify(ruleSet.value)); });
 function matchingRule(item) { return ruleSet.value.find(r => r.commodity === item.commodity && r.horizon_days === item.horizon_days); }
-function openReport(id) { router.push(`/reports/${id}`); }
+function openReport(id) { router.push({ name: 'editor', params: { id }, query: { mode: 'view' } }); }
 function openConfirm(rows) { confirmation.value = rows.map(row => ({...row, basis:row.draft_basis || row.excerpt, horizon_days: row.horizon_days || undefined, condition_confirmed:false})); reviewed.value = false; confirmVisible.value = true; }
 async function confirmSelected() {
   if (saving.value || !reviewed.value) return;
@@ -419,7 +420,7 @@ onMounted(()=>{load();refreshAIJob();});
 .vp-list-heading :deep(.el-radio-button.is-active .el-radio-button__inner) { background:var(--el-color-primary-light-9); color:var(--el-color-primary); border-color:transparent; box-shadow:none; }
 .vp-filters { margin:0 22px 20px; padding:0; background:transparent; border:0; gap:10px; display:flex; flex-wrap:wrap; }
 .vp-filters :deep(.el-input__wrapper), .vp-filters :deep(.el-select__wrapper) { border-radius:7px; min-height:34px; }
-.vp-records :deep(.el-table) { --el-table-header-bg-color:#f7f9fb; --el-table-border-color:#eef1f5; --el-table-row-hover-bg-color:#f8fbfd; font-size:13px; }
+.vp-records :deep(.el-table) { font-size:13px; }
 .vp-records :deep(.el-table th.el-table__cell) { font-weight:500; color:#758297; height:42px; }
 .vp-records :deep(.el-table td.el-table__cell) { padding:16px 0; color:#37465b; }
 .vp-records :deep(.el-table .cell) { padding-left:16px; padding-right:16px; }
@@ -455,4 +456,33 @@ onMounted(()=>{load();refreshAIJob();});
 .vp-portrait { padding: 18px 20px; }
 .panel-header h3 { margin: 0 0 4px; font-size: 15px; }
 @media (max-width: 1100px) { .vp-portraits { grid-template-columns: minmax(0, 1fr); } }
+
+/* 与全站终端皮肤对齐：方角、墨蓝强调、表头不填底色（放在最后以覆盖上面的早期分层样式） */
+.viewpoints-page { --vp-border: var(--line); --vp-muted: var(--ink-3); }
+.vp-toolbar { border-radius: var(--radius); padding: 12px 16px; border-color: var(--line); }
+.vp-date-field { color: var(--ink-3); }
+.vp-summary > div { border-right-color: var(--line); padding-right: 24px; gap: 10px; }
+.vp-summary span { color: var(--ink-3); font-size: 12px; }
+.vp-summary strong { font-size: 22px; color: var(--ink-1); letter-spacing: -0.02em; }
+.vp-summary > div:first-child strong { color: var(--ink-1); }
+.vp-tabs { padding: 0 16px; border-radius: var(--radius) var(--radius) 0 0; border-color: var(--line); }
+.vp-tabs :deep(.el-tabs__item) { height: 42px; font-size: 13px; }
+.vp-tabs :deep(.el-tabs__nav-wrap::after) { background: var(--line-2); }
+.vp-records { border-color: var(--line); border-radius: 0 0 var(--radius) var(--radius); }
+.vp-list-heading { padding: 12px 16px; }
+.vp-list-heading h3 { font-size: 13px; color: var(--ink-2); }
+.vp-filters { margin: 0 16px 14px; }
+.vp-filters :deep(.el-input__wrapper), .vp-filters :deep(.el-select__wrapper) { border-radius: var(--radius); min-height: 32px; }
+
+.vp-records :deep(.el-table th.el-table__cell) { color: var(--ink-3); font-size: 12px; height: 38px; }
+.vp-records :deep(.el-table td.el-table__cell) { padding: 10px 0; color: var(--ink-1); }
+.vp-records :deep(.el-table .cell) { padding-left: 16px; padding-right: 16px; }
+.vp-records :deep(.el-tag) { border-radius: var(--radius); }
+.vp-pagination { padding: 12px 16px; }
+.vp-list-heading :deep(.el-radio-button__inner) { border-radius: var(--radius); background: var(--el-fill-color-light); color: var(--ink-2); }
+.vp-list-heading :deep(.el-radio-button.is-active .el-radio-button__inner) { background: var(--accent-soft); color: var(--accent); }
+.vp-portrait { border-radius: var(--radius); border-color: var(--line); }
+.vp-ai-task { color: var(--ink-2); }
+.vp-original summary { color: var(--ink-3); }
+.vp-stat-note { color: var(--ink-3); }
 </style>

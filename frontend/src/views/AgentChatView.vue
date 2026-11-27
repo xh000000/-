@@ -1,18 +1,16 @@
 <template>
   <div class="agent-page">
-    <PageHead
-      title="AI 问答"
-      description="围绕研报、指标和研究资料展开对话。需要成稿时，从左侧开始生成研报。"
-    >
-      <span v-if="status?.configured" class="tiny agent-model">模型：{{ status.model }}</span>
-      <el-button v-if="canGenerate" @click="jobsVisible = true">生成记录<span v-if="activeJobCount"> · {{ activeJobCount }} 进行中</span></el-button>
-      <el-button :loading="threadsLoading" @click="loadThreads">刷新</el-button>
-    </PageHead>
+    <PageContainer title="AI 问答">
+      <template #actions>
+        <span v-if="status?.configured" class="tiny agent-model">模型：{{ status.model }}</span>
+        <el-button v-if="canGenerate" @click="jobsVisible = true">生成记录<span v-if="activeJobCount"> · {{ activeJobCount }} 进行中</span></el-button>
+        <el-button :loading="threadsLoading" @click="loadThreads">刷新</el-button>
+      </template>
 
     <el-drawer v-if="canGenerate" v-model="jobsVisible" title="研报生成记录" size="min(560px, 100vw)">
     <section class="report-workbench">
       <div class="report-workbench-head">
-        <div><b>最近生成任务</b><p class="caption">查看章节进度，返回研报核对并采用候选。</p></div>
+        <div><b>最近生成任务</b></div>
         <el-button :loading="jobsLoading" @click="loadReportJobs">刷新任务</el-button>
       </div>
       <p v-if="jobsError" role="alert">{{ jobsError }}</p>
@@ -67,8 +65,8 @@
         <div v-if="canGenerate" class="agent-report-entry">
           <span class="agent-entry-label">从研究到成稿</span>
           <p>沿用分类模板和 Skill，生成有数据依据的研报候选。</p>
-          <el-button class="agent-report-button" @click="reportDialog = true"><el-icon><DocumentAdd /></el-icon><span>AI 生成研报</span><span aria-hidden="true">↗</span></el-button>
-          <button class="agent-report-link" type="button" @click="router.push('/reports')">前往研报中心 →</button>
+          <el-button class="agent-report-button" @click="reportDialog = true"><el-icon><DocumentAdd /></el-icon><span>AI 生成研报</span></el-button>
+          <button class="agent-report-link" type="button" @click="router.push('/reports')">前往研报中心</button>
         </div>
       </div>
 
@@ -121,6 +119,7 @@
         </div>
       </div>
     </div>
+    </PageContainer>
   </div>
 </template>
 
@@ -131,7 +130,7 @@ import { createdReportRoute } from '../utils/reportCreation';
 import { DocumentAdd } from '@element-plus/icons-vue';
 import NewReportDialog from '../components/NewReportDialog.vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api, del } from '../api';
 import { user } from '../store/session';
 
@@ -398,7 +397,7 @@ onUnmounted(() => { disposed = true; clearTimeout(jobsTimer); stop(); });
 .report-job { padding:18px 0; border-bottom:1px solid var(--el-border-color-lighter); flex-wrap:wrap; }
 .report-job>div { flex-basis:100%; }
 .report-job-error { color:var(--el-color-danger); overflow-wrap:anywhere; }
-.agent-welcome h3 { font-size:26px; font-weight:600; letter-spacing:-.5px; }
+.agent-welcome h3 { font-size:22px; font-weight:600; letter-spacing:-.02em; color:var(--ink-1); }
 .agent-welcome { max-width:560px; }
 .agent-suggest { margin-top:24px; }
 @media(max-width:760px) { .agent-threads { max-height:300px; } .agent-report-entry { padding:12px; } .agent-report-entry p { display:none; } .agent-report-button { margin-top:8px; } }

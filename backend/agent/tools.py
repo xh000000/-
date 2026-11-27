@@ -260,7 +260,7 @@ def _generate_report_with_skill(user):
                 report=report_writer.writable(s,report_id,user)
                 ids=[x['id'] for x in json.loads(report.document)['sections'] if report_writer.can_generate(report,user,x)]
                 result=report_writer.enqueue_job(s,user,{'report_id':report.id,'version':report.version,'skill_ids':[skill_id],'section_ids':ids,'library_ids':[]})
-            return _dump({**result,'report_id':report_id,'message':'任务已排队，请到研报编辑器 → AI / Skill 生成查看进度与候选，确认后再保存'})
+            return _dump({**result,'report_id':report_id,'message':'任务已排队，请到研报编辑器本章工具栏的「AI 生成」查看进度与候选，确认后再保存'})
         except Exception as exc: return _dump({'error':str(exc)[:200]})
     return run
 

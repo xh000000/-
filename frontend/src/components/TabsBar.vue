@@ -1,25 +1,30 @@
 <template>
   <div class="tabs-bar">
-    <button v-show="overflow.left" class="scroll-btn is-left" type="button" title="向左滚动" @click="scrollBy(-240)">
-      <el-icon><ArrowLeft /></el-icon>
-    </button>
-    <div ref="trackRef" class="tabs-track" @wheel="onWheel" @scroll="updateOverflow">
-      <div
-        v-for="tab in tabs"
-        :key="tab.path"
-        class="tab"
-        :class="{ 'is-active': tab.path === route.path }"
-        :title="tab.title"
-        @click="go(tab)"
-        @contextmenu="openMenu($event, tab)"
-      >
-        <span class="label">{{ tab.title }}</span>
-        <el-icon v-if="tab.closable" class="close" @click.stop="closeTab(tab)"><Close /></el-icon>
+    <div class="tabs-main">
+      <button v-show="overflow.left" class="scroll-btn is-left" type="button" title="向左滚动" @click="scrollBy(-240)">
+        <el-icon><ArrowLeft /></el-icon>
+      </button>
+      <div ref="trackRef" class="tabs-track" @wheel="onWheel" @scroll="updateOverflow">
+        <div
+          v-for="tab in tabs"
+          :key="tab.path"
+          class="tab"
+          :class="{ 'is-active': tab.path === route.path }"
+          :title="tab.title"
+          @click="go(tab)"
+          @contextmenu="openMenu($event, tab)"
+        >
+          <span class="label">{{ tab.title }}</span>
+          <el-icon v-if="tab.closable" class="close" @click.stop="closeTab(tab)"><Close /></el-icon>
+        </div>
       </div>
+      <button v-show="overflow.right" class="scroll-btn is-right" type="button" title="向右滚动" @click="scrollBy(240)">
+        <el-icon><ArrowRight /></el-icon>
+      </button>
     </div>
-    <button v-show="overflow.right" class="scroll-btn is-right" type="button" title="向右滚动" @click="scrollBy(240)">
-      <el-icon><ArrowRight /></el-icon>
-    </button>
+    <div v-if="$slots.tools" class="tabs-tools">
+      <slot name="tools" />
+    </div>
   </div>
 
   <Teleport to="body">
@@ -178,20 +183,26 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .tabs-bar {
-  position: relative;
   flex: none;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   height: var(--app-tabs-h);
-  background: #fff;
-  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.tabs-main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
 }
 .tabs-track {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: stretch;
-  gap: 2px;
+  gap: 0;
   height: 100%;
   padding: 0 20px;
   overflow-x: auto;
@@ -199,6 +210,14 @@ onBeforeUnmount(() => {
   scrollbar-width: none;
 }
 .tabs-track::-webkit-scrollbar { height: 0; }
+/* 右侧工具位：账号等信息放在页签同一行，省掉一条独立工具栏 */
+.tabs-tools {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 12px;
+  border-left: 1px solid var(--line-2);
+}
 
 /* 页签溢出时的左右滚动按钮，贴在两端，白底渐隐压住底下文字 */
 .scroll-btn {
@@ -211,15 +230,16 @@ onBeforeUnmount(() => {
   place-items: center;
   padding: 0;
   border: 0;
-  color: #97a1b1;
+  color: var(--ink-3);
+  background: var(--surface);
   cursor: pointer;
 }
 .scroll-btn .el-icon { font-size: 12px; }
-.scroll-btn:hover { color: var(--el-color-primary); }
-.scroll-btn.is-left { left: 0; background: linear-gradient(90deg, #fff 55%, rgba(255, 255, 255, 0)); }
-.scroll-btn.is-right { right: 0; background: linear-gradient(270deg, #fff 55%, rgba(255, 255, 255, 0)); }
+.scroll-btn:hover { color: var(--accent); }
+.scroll-btn.is-left { left: 0; }
+.scroll-btn.is-right { right: 0; }
 
-/* 页签＝整行高度的一段文字，激活用底部蓝线标示，不额外加框 */
+/* 页签＝一段文字，激活用底部一道墨蓝线标示，不额外加框 */
 .tab {
   position: relative;
   flex: none;
@@ -229,24 +249,23 @@ onBeforeUnmount(() => {
   max-width: 190px;
   padding: 0 12px;
   font-size: 13px;
-  color: #5b6472;
+  color: var(--ink-2);
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
-  transition: color 0.15s ease, background-color 0.15s ease;
+  transition: color 0.15s ease;
 }
 .tab .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.tab:hover { background: #f6f8fb; color: #1f2d3d; }
-.tab.is-active { color: #1c6fd0; font-weight: 600; }
+.tab:hover { color: var(--ink-1); background: var(--el-fill-color-light); }
+.tab.is-active { color: var(--ink-1); font-weight: 600; }
 .tab.is-active::after {
   content: '';
   position: absolute;
-  left: 10px;
-  right: 10px;
+  left: 12px;
+  right: 12px;
   bottom: 0;
   height: 2px;
-  background: var(--el-color-primary);
-  border-radius: 2px 2px 0 0;
+  background: var(--accent);
 }
 /* 图标所在的盒子固定 15px：el-icon 默认 1em，加 padding 会被全局 border-box 压扁 */
 .tab .close {
@@ -254,37 +273,38 @@ onBeforeUnmount(() => {
   width: 15px;
   height: 15px;
   font-size: 11px;
-  color: #a9b3c2;
-  border-radius: 50%;
+  color: var(--ink-3);
+  border-radius: 2px;
   opacity: 0;
   transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
 }
 .tab:hover .close,
 .tab.is-active .close { opacity: 1; }
-.tab .close:hover { background: #eff2f7; color: var(--el-color-danger); }
+.tab .close:hover { background: #f0f3f5; color: var(--up); }
 
 .tab-menu {
   position: fixed;
   z-index: 3000;
-  min-width: 108px;
+  min-width: 116px;
   padding: 4px;
-  background: #fff;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
-  box-shadow: var(--app-shadow);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--el-box-shadow-light);
 }
 .tab-menu button {
   display: block;
   width: 100%;
-  padding: 5px 10px;
+  padding: 6px 10px;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius);
   background: none;
+  font-family: inherit;
   font-size: 12.5px;
-  color: var(--el-text-color-regular);
+  color: var(--ink-2);
   text-align: left;
   cursor: pointer;
 }
-.tab-menu button:hover:not(:disabled) { background: var(--app-page-bg); color: var(--el-color-primary); }
+.tab-menu button:hover:not(:disabled) { background: var(--el-fill-color-light); color: var(--ink-1); }
 .tab-menu button:disabled { color: var(--el-text-color-placeholder); cursor: not-allowed; }
 </style>

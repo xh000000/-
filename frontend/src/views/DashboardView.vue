@@ -1,6 +1,6 @@
 <template>
   <div>
-    <PageHead title="工作台" description="研报主线六步：数据入库 → 研究撰写 → 研究复核 → 合规审核 → 内部发布 → 知识沉淀。" />
+    <PageContainer title="工作台">
 
     <div class="stat-grid">
       <div v-for="card in cards" :key="card.label" class="stat-card">
@@ -8,13 +8,6 @@
         <b>{{ card.value }}</b>
       </div>
     </div>
-
-    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 14px">
-      <template #title>
-        数据接入：当前支持授权导出后的 CSV 导入与手工录入，实时行情接口尚未接通。
-        AI：{{ session.data?.ai ? '已配置外部模型（' + session.data.model + '）' : '未配置外部模型' }}。
-      </template>
-    </el-alert>
 
     <div class="steps">
       <span v-for="step in steps" :key="step">{{ step }}</span>
@@ -25,11 +18,12 @@
         <h3>近期研究</h3>
         <el-button type="primary" :disabled="!canCreate" @click="dialogVisible = true">新建研报</el-button>
       </div>
-      <ReportTable :reports="recent" @open="openReport" @more="moreVisible = true; moreId = $event" />
+      <ReportTable :reports="recent" @open="openReport" @edit="editReport" @more="moreVisible = true; moreId = $event" />
     </div>
 
     <NewReportDialog v-model="dialogVisible" @created="createdReport" />
-    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" />
+    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" @edit="editReport" />
+    </PageContainer>
   </div>
 </template>
 
@@ -37,7 +31,7 @@
 import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { createdReportRoute } from '../utils/reportCreation';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import ReportTable from '../components/ReportTable.vue';
 import NewReportDialog from '../components/NewReportDialog.vue';
 import ReportActionDialog from '../components/ReportActionDialog.vue';
@@ -65,5 +59,7 @@ const cards = computed(() => {
 
 const recent = computed(() => sortReports(reports.value).slice(0, 8));
 
-const openReport = id => router.push({ name: 'editor', params: { id } });
+/* 与研报中心一致：点标题进只读详情，点「编辑」才进编辑态。 */
+const openReport = id => router.push({ name: 'editor', params: { id }, query: { mode: 'view' } });
+const editReport = id => router.push({ name: 'editor', params: { id } });
 </script>

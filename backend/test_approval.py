@@ -66,6 +66,30 @@ class ApprovalChecks(ReportCreation):
     self.assertEqual(sum(e['action']=='发布' for e in history),1)
     self.assertTrue(any(e['action']=='退回' and e['note']=='补充数据来源' for e in history))
     print('审批模式通过:',mode,flush=True)
+ def test_edit_lock_follows_flow(self):
+  """可编辑性跟着审批节点走：送审即锁、退回解锁、再送审再锁。"""
+  self.assertEqual(self.flow('any')[0],200);rid=self.prepared()['id']
+  self.assertTrue(self.report(rid)['can_edit'],'草稿应可编辑')
+  self.assertEqual(self.report(rid)['current_node'],None)
+  self.assertEqual(self.transition(self.owner,rid,'提交')[0],200)
+  r=self.report(rid)
+  self.assertEqual(r['status'],'研究复核')
+  self.assertFalse(r['can_edit'],'送审后作者不能改正文')
+  self.assertIn('研究复核',r['edit_reason'])
+  self.assertEqual(r['current_node']['label'],'研究复核')
+  self.assertEqual(r['current_node']['role'],'reviewer')
+  sec=json.loads(r['document'])['sections'][0]
+  for client in [self.owner,self.clients['create-review']]:
+   self.assertEqual(self.call(client,'chapter/save',{'id':rid,'section_id':sec['id'],'revision':sec['revision'],'blocks':sec['blocks']})[0],403,'审批中任何人不能保存章节')
+   self.assertEqual(self.call(client,'report-info',{'id':rid,'version':r['version'],'title':'审批中改名'})[0],403,'审批中不能改基础信息')
+  # 审批人只能通过/退回，退回后作者恢复可编辑，再送审重新锁定
+  self.assertEqual(self.transition(self.clients['create-review'],rid,'退回','补充数据来源')[0],200)
+  r=self.report(rid)
+  self.assertEqual(r['status'],'已退回');self.assertTrue(r['can_edit'])
+  self.assertIn('已退回',r['edit_reason'])
+  self.assertEqual(self.transition(self.owner,rid,'提交')[0],200)
+  self.assertFalse(self.report(rid)['can_edit'])
+  print('审批中编辑锁通过',flush=True)
  def test_concurrent_review_and_publish(self):
   self.assertEqual(self.flow('all')[0],200);rid=self.prepared()['id'];self.transition(self.owner,rid,'提交');r=self.report(rid)
   payload={'id':rid,'action':'通过','expected_status':r['status'],'expected_workflow':r['workflow_state']};barrier=threading.Barrier(2)

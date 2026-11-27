@@ -1,8 +1,9 @@
 <template>
   <div>
-    <PageHead title="账号管理" description="维护账号、角色与部门归属；禁用账号后无法登录，已登录会话立即失效。">
-      <el-button type="primary" @click="openUser(null)">添加账号</el-button>
-    </PageHead>
+    <PageContainer title="账号管理">
+      <template #actions>
+        <el-button type="primary" @click="openUser(null)">添加账号</el-button>
+      </template>
 
     <div class="panel">
       <div class="panel-header">
@@ -35,13 +36,14 @@
         <el-table-column label="最近登录" width="150">
           <template #default="{ row }">{{ localTime(row.last_login_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200">
+        <el-table-column label="操作" width="240">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openUser(row)">编辑</el-button>
             <el-button link type="primary" size="small" @click="openReset(row)">重置密码</el-button>
             <el-button link :type="row.enabled ? 'danger' : 'success'" size="small" @click="toggleUser(row)">
               {{ row.enabled ? '禁用' : '启用' }}
             </el-button>
+            <el-button link type="danger" size="small" :disabled="row.id === me.id" :loading="removing === row.id" @click="removeUser(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -88,7 +90,6 @@
           <el-switch v-model="userForm.enabled" />
         </el-form-item>
       </el-form>
-      <p class="caption">角色决定可访问的菜单与审批资格；管理员账号不能停用自己，系统至少保留一个可用管理员。</p>
       <template #footer>
         <el-button @click="userVisible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="saveUser">保存</el-button>
@@ -97,9 +98,6 @@
 
     <!-- 重置密码 -->
     <el-dialog v-model="resetVisible" title="重置密码" width="420px" @closed="resetForm.password = ''">
-      <p class="caption" style="margin-bottom: 12px">
-        为 <b>{{ resetForm.name }}</b> 设置新密码；保存后该账号的全部登录会话立即失效。
-      </p>
       <el-form label-width="84px" @submit.prevent="saveReset">
         <el-form-item label="新密码">
           <el-input v-model="resetForm.password" type="password" show-password placeholder="至少 6 位" autocomplete="new-password" />
@@ -110,17 +108,22 @@
         <el-button type="primary" :loading="busy" @click="saveReset">确认重置</el-button>
       </template>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { departments, refresh, roles, user as me, users } from '../store/session';
 import { ROLE_NAMES, localTime } from '../utils/format';
 const busy = ref(false);
+const removing = ref(null);
+
+/* 后端校验文案本身是完整句子，去掉框架统一加的「输入无效：」前缀更好读 */
+const plain = message => String(message || '').replace(/^输入无效：/, '');
 
 /* ---------- 用户 ---------- */
 const userVisible = ref(false);
@@ -172,7 +175,7 @@ async function saveUser() {
     userVisible.value = false;
     ElMessage.success('账号已保存');
   } catch (error) {
-    ElMessage.error(error.message || '保存失败');
+    ElMessage.error(plain(error.message) || '保存失败');
   } finally {
     busy.value = false;
   }
@@ -195,7 +198,30 @@ async function toggleUser(row) {
     await refresh();
     ElMessage.success('账号状态已更新');
   } catch (error) {
-    ElMessage.error(error.message || '操作失败');
+    ElMessage.error(plain(error.message) || '操作失败');
+  }
+}
+
+async function removeUser(row) {
+  if (row.id === me.value.id) return ElMessage.warning('不能删除自己的账号');
+  try {
+    await ElMessageBox.confirm(
+      `删除后该账号立即无法登录，历史研报与审批记录保留。若只是暂停使用，请改用「禁用」。确定删除「${row.name}」？`,
+      '删除账号',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    );
+  } catch {
+    return;
+  }
+  removing.value = row.id;
+  try {
+    await api('users', { action: 'delete', id: row.id });
+    await refresh();
+    ElMessage.success('账号已删除');
+  } catch (error) {
+    ElMessage.error(plain(error.message) || '删除失败');
+  } finally {
+    removing.value = null;
   }
 }
 
@@ -217,7 +243,7 @@ async function saveReset() {
     resetVisible.value = false;
     ElMessage.success('密码已重置，请通知本人使用新密码登录');
   } catch (error) {
-    ElMessage.error(error.message || '重置失败');
+    ElMessage.error(plain(error.message) || '重置失败');
   } finally {
     busy.value = false;
   }

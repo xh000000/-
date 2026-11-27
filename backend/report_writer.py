@@ -96,7 +96,10 @@ def get_skills(request:Request, session=Depends(viewpoint.get_session)):
 async def post_skills(request:Request, session=Depends(viewpoint.get_session)):
     import app
     user=auth(request,session,read_only=True)
-    return skills.save(session,await app.payload(request),user,app.stamp())
+    data=await app.payload(request)
+    if data.get('action')=='delete':
+        return skills.delete(session,data,user,app.stamp())
+    return skills.save(session,data,user,app.stamp())
 
 
 @router.post('/skills/inspect-zip')
@@ -171,7 +174,7 @@ def chat_candidate(s,user,r,section,content):
     task=AgentTask(id=uuid.uuid4().hex,kind=KIND,user_id=user['id'],thread_id='',message='AI 问答章节候选：'+r.title,
         payload=json.dumps(plan,ensure_ascii=False),result=json.dumps(result,ensure_ascii=False),status='已完成',created_at=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f UTC'),finished_at=app.stamp())
     s.add(task);s.commit()
-    return {'ok':True,'task_id':task.id,'report_id':r.id,'section_id':section['id'],'note':'候选已保存，请到研报编辑器的 AI / Skill 生成中核对采用；尚未写入正文或送审'}
+    return {'ok':True,'task_id':task.id,'report_id':r.id,'section_id':section['id'],'note':'候选已保存，请到研报编辑器本章工具栏的「AI 生成」中核对采用；尚未写入正文或送审'}
 
 
 def prepare(s,user,data):

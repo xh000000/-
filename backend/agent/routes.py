@@ -153,20 +153,3 @@ async def post_pipeline(request: Request, session: Session = Depends(get_session
     return {'id': task_id, 'status': '排队中'}
 
 
-# ---------------------------------------------------------------------------
-# 研报 AI 摘要卡
-# ---------------------------------------------------------------------------
-@router.post('/summary', summary='为研报生成三段式 AI 摘要卡（核心观点/逻辑链/数据要点）')
-async def post_summary(request: Request, session: Session = Depends(get_session)):
-    user = _auth(request, session)
-    data = await _body(request)
-    import app as platform
-    import agent.summarize as summarize
-    try:
-        return {'summary': summarize.generate(session, user, data.get('id'))}
-    except PermissionError as exc:
-        raise platform.ApiError(403, str(exc))
-    except ValueError as exc:
-        raise platform.ApiError(400, str(exc))
-    except Exception as exc:  # 模型网络抖动等
-        raise platform.ApiError(502, '摘要生成失败：' + str(exc)[:200])

@@ -1,9 +1,10 @@
 <template>
   <div>
     <template v-if="!draft">
-      <PageHead title="研报分类树" description="最多三级。末级分类配置报告章节结构与关联审批流；上级分类用于组织目录。">
-        <el-button type="primary" @click="openTreeDialog(null)">添加分类</el-button>
-      </PageHead>
+      <PageContainer title="研报分类树">
+        <template #actions>
+          <el-button type="primary" @click="openTreeDialog(null)">添加分类</el-button>
+        </template>
 
       <div class="panel">
         <el-table
@@ -33,20 +34,23 @@
             <template #default="{ row }"><span v-if="!row.folder">{{ flows.find(flow => flow.category_ids.includes(row.id))?.name || '沿用上级或默认流程' }}</span></template>
           </el-table-column>
           <el-table-column label="排序" width="80" prop="sort_order" />
-          <el-table-column label="操作" width="210">
+          <el-table-column label="操作" width="180">
             <template #default="{ row }">
-              <el-button link type="primary" size="small" @click="openTreeDialog(row)">编辑分类</el-button>
-              <el-button v-if="!row.folder" link type="primary" size="small" @click="startConfig(row)">章节与审批配置</el-button>
+              <el-button link type="primary" size="small" @click="openTreeDialog(row)">编辑</el-button>
+              <el-button link type="danger" size="small" :disabled="busy" @click="deleteCategory(row)">删除</el-button>
+              <el-button v-if="!row.folder" link type="primary" size="small" title="章节与审批配置" @click="startConfig(row)">配置</el-button>
             </template>
           </el-table-column>
         </el-table>
       </div>
+      </PageContainer>
     </template>
 
     <template v-else>
-      <PageHead :title="draft.name" description="配置章节结构、版式与关联审批流；新建研报自动继承；已有草稿可在编辑器主动同步章节与审批，送审后的报告继续沿用原快照。">
-        <el-button @click="draft = null">返回分类列表</el-button>
-      </PageHead>
+      <PageContainer :title="draft.name">
+        <template #actions>
+          <el-button @click="draft = null">返回分类列表</el-button>
+        </template>
 
       <div class="config-grid">
         <div class="panel">
@@ -71,7 +75,6 @@
               <el-input v-model="draft.config.title_pattern" />
             </el-form-item>
           </div>
-          <p class="caption">标题规则支持 {品种}、{类型}、{日期}（YYYY-MM-DD）与 {日期点分}（YYYY.MM.DD），研究员创建时可修改标题。</p>
         </div>
 
         <div class="panel">
@@ -165,7 +168,6 @@
                     </el-option>
                   </el-option-group>
                 </el-select>
-                <p class="caption">按板块分组选择本章覆盖的品种，新建报告时自动带到章节上；清空表示不限品种。</p>
               </div>
             </el-form-item>
           </div>
@@ -182,13 +184,13 @@
               </el-select>
             </el-form-item>
           </el-form>
-          <p class="caption">节点在“审批流设置”中统一维护。新研报使用关联流程；已有草稿可在编辑器同步，已送审研报保持原审批快照。</p>
         </div>
       </div>
       <div class="panel category-config-actions">
         <el-button type="primary" :loading="busy" @click="saveConfig">保存配置</el-button>
         <el-button :disabled="busy" @click="draft = null">取消</el-button>
       </div>
+      </PageContainer>
     </template>
 
     <!-- 分类编辑 -->
@@ -220,7 +222,6 @@
           <el-switch v-model="treeForm.enabled" />
         </el-form-item>
       </el-form>
-      <p class="caption">系统会校验循环引用、三级深度与同级重名；父级停用时子级不可用于创建报告。</p>
       <template #footer>
         <el-button @click="treeVisible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="saveTree">保存</el-button>
@@ -232,11 +233,14 @@
 <script setup>
 import { computed, reactive, ref, onMounted } from 'vue';
 import { useRoute } from 'vue-router';
-import { ElMessage } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { categories, categoryTree, commodities, refresh, flows } from '../store/session';
 import { makeId } from '../utils/format';
+
+/* 后端校验文案已是一整句，去掉框架统一加的「输入无效：」前缀更好读 */
+const plainError = (error, fallback) => String(error?.message || fallback).replace(/^输入无效：/, '');
 
 const busy = ref(false);
 
@@ -291,7 +295,34 @@ async function saveTree() {
     treeVisible.value = false;
     ElMessage.success('分类已保存');
   } catch (error) {
-    ElMessage.error(error.message || '保存失败');
+    ElMessage.error(plainError(error, '保存失败'));
+  } finally {
+    busy.value = false;
+  }
+}
+
+/* 删除分类：后端会挡住「有子分类 / 有研报 / 被审批流引用」三种情况并给出原因，
+   前端只负责二次确认，不预先猜能不能删。 */
+async function deleteCategory(row) {
+  const name = row.name || row.label;
+  try {
+    await ElMessageBox.confirm(
+      row.folder
+        ? `确定删除目录「${name}」？目录下还有子分类时无法删除。`
+        : `确定删除分类「${name}」？删除后不可恢复；已有研报的分类只能改为停用。`,
+      '删除分类',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    );
+  } catch {
+    return;
+  }
+  busy.value = true;
+  try {
+    await api('category-tree', { action: 'delete', id: row.id });
+    await refresh();
+    ElMessage.success('分类已删除');
+  } catch (error) {
+    ElMessage.error(plainError(error, '删除失败'));
   } finally {
     busy.value = false;
   }
@@ -365,7 +396,7 @@ async function saveConfig() {
     draft.value = null;
     ElMessage.success('分类配置已保存');
   } catch (error) {
-    ElMessage.error(error.message || '保存失败');
+    ElMessage.error(plainError(error, '保存失败'));
   } finally {
     busy.value = false;
   }

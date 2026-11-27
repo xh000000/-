@@ -39,7 +39,8 @@ def migrate(s):
     db.create_schema()
     add_columns(s, 'users', {'dept_id': 'INTEGER', 'phone': "TEXT DEFAULT ''", 'title': "TEXT DEFAULT ''",
                              'enabled': 'INTEGER DEFAULT 1', 'role_id': 'INTEGER',
-                             'created_at': "TEXT DEFAULT ''", 'last_login_at': "TEXT DEFAULT ''"})
+                             'created_at': "TEXT DEFAULT ''", 'last_login_at': "TEXT DEFAULT ''",
+                             'status': 'INTEGER DEFAULT 1'})
     add_columns(s, 'sessions', {'remember': 'INTEGER DEFAULT 0', 'last_seen': 'REAL DEFAULT 0'})
     if not s.execute(select(func.count()).select_from(Role)).scalar():
         for code, label in BASE_ROLES:
@@ -70,7 +71,8 @@ def menus_for(s, u):
 
 
 def roles(s):
-    counts = dict(s.execute(select(User.role_id, func.count()).group_by(User.role_id)).all())
+    counts = dict(s.execute(select(User.role_id, func.count()).where(func.coalesce(User.status,1)==1)
+                          .group_by(User.role_id)).all())
     out = []
     for role in s.execute(select(Role).order_by(Role.builtin.desc(), Role.id)).scalars():
         item = role.to_dict()
@@ -83,7 +85,8 @@ def roles(s):
 def departments(s):
     rows = [x.to_dict() for x in s.execute(select(Department).order_by(Department.sort_order, Department.id)).scalars()]
     index = {r['id']: r for r in rows}
-    counts = dict(s.execute(select(User.dept_id, func.count()).group_by(User.dept_id)).all())
+    counts = dict(s.execute(select(User.dept_id, func.count()).where(func.coalesce(User.status,1)==1)
+                          .group_by(User.dept_id)).all())
     for r in rows:
         r['depth'] = 2 if r['parent_id'] else 1
         parent = index.get(r['parent_id'])
@@ -105,6 +108,7 @@ def users(s):
                Role.name.label('role_name'), Department.name.label('dept_name'))
         .outerjoin(Role, Role.id == User.role_id)
         .outerjoin(Department, Department.id == User.dept_id)
+        .where(func.coalesce(User.status, 1) == 1)
         .order_by(User.id))
     return [dict(r._mapping) for r in rows]
 
@@ -149,7 +153,8 @@ def clean_nodes(s, nodes):
 
 
 def _admin_count(s, exclude=None):
-    query = select(func.count()).select_from(User).where(User.role == 'admin', User.enabled == 1)
+    query = (select(func.count()).select_from(User)
+             .where(User.role == 'admin', User.enabled == 1, func.coalesce(User.status, 1) == 1))
     if exclude is not None:
         query = query.where(User.id != exclude)
     return s.execute(query).scalar()
@@ -157,6 +162,19 @@ def _admin_count(s, exclude=None):
 
 def _drop_sessions(s, uid):
     s.execute(delete(SessionRow).where(SessionRow.user_id == uid))
+
+
+def _released_name(s, name, rid):
+    """软删除后把唯一姓名腾出来，避免以后加同名账号撞唯一约束。
+
+    行本身要留着（审计、历史研报归属），所以只能改名；后缀写「（已删除）」，
+    万一撞名（重复删除不同账号后同名）再拼上 id。
+    """
+    base = name if name.endswith('（已删除）') else name + '（已删除）'
+    candidate = base[:191]
+    if s.execute(select(User.id).where(User.name == candidate)).first() is None:
+        return candidate
+    return (base[:180] + '#' + str(rid))[:191]
 
 
 def handle(s, path, d, u, stamp, password):
@@ -201,6 +219,17 @@ def handle(s, path, d, u, stamp, password):
             target.enabled = enabled
             if not enabled:
                 _drop_sessions(s, rid)
+            return {'ok': True}, 200
+        if action == 'delete':
+            if rid == u['id']:
+                return {'error': '不能删除自己的账号'}, 400
+            if target.role == 'admin' and _admin_count(s, exclude=rid) == 0:
+                return {'error': '至少保留一个可用管理员'}, 400
+            _drop_sessions(s, rid)
+            # 逻辑删除：账号行留在库里（历史研报、审批记录里的操作人还能对上名字），只把状态置 0
+            target.status = 0
+            target.enabled = 0
+            target.name = _released_name(s, target.name, rid)
             return {'ok': True}, 200
         name = e.text(d.get('name', target.name if target else ''), 40).strip()
         if not name:
@@ -255,7 +284,7 @@ def handle(s, path, d, u, stamp, password):
                 return {'error': '部门不存在'}, 404
             if s.execute(select(Department.id).where(Department.parent_id == rid).limit(1)).first():
                 return {'error': '请先删除下级分组'}, 400
-            if s.execute(select(User.id).where(User.dept_id == rid).limit(1)).first():
+            if s.execute(select(User.id).where(User.dept_id == rid, func.coalesce(User.status, 1) == 1).limit(1)).first():
                 return {'error': '该部门下仍有账号，请先调整所属部门'}, 400
             s.delete(target)
             return {'ok': True}, 200
@@ -297,7 +326,7 @@ def handle(s, path, d, u, stamp, password):
                 return {'error': '角色不存在'}, 404
             if target.builtin:
                 return {'error': '内置角色不可删除，可修改其菜单权限'}, 400
-            if s.execute(select(User.id).where(User.role_id == rid).limit(1)).first():
+            if s.execute(select(User.id).where(User.role_id == rid, func.coalesce(User.status, 1) == 1).limit(1)).first():
                 return {'error': '该角色下仍有账号，请先调整账号角色'}, 400
             s.delete(target)
             return {'ok': True}, 200

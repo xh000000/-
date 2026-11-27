@@ -1,15 +1,9 @@
 <template>
   <div>
-    <PageHead
-      title="审批流设置"
-      description="为指定分类配置多节点审批流；新建报告时按分类匹配并快照，未匹配的分类沿用分类自带的审批节点。"
-    >
-      <el-button type="primary" @click="openDialog(null)">添加审批流</el-button>
-    </PageHead>
-
-    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 18px"
-      title="研报审批规则"
-      description="支持或签、会签和依次审批；审批流必须包含合规审核节点。新建研报时保存审批流快照；作者不能审核或发布自己的报告。" />
+    <PageContainer title="审批流设置">
+      <template #actions>
+        <el-button type="primary" @click="openDialog(null)">添加审批流</el-button>
+      </template>
     <div class="panel">
       <el-table :data="flows" empty-text="暂无审批流">
         <el-table-column label="名称" min-width="140" prop="name" />
@@ -104,20 +98,20 @@
         </el-form-item>
       </div>
 
-      <p class="caption">审批流必须包含一个合规审核节点；会签与依次审批必须指定审批人。作者不能审核或发布自己的报告。</p>
 
       <template #footer>
         <el-button @click="visible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="save">保存</el-button>
       </template>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { computed, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { categoryTree, flows, refresh, users } from '../store/session';
 import { MODE_NAMES } from '../utils/format';

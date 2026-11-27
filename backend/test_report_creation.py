@@ -149,6 +149,25 @@ class ReportCreation(Workflow):
         self.assertNotIn(private['id'],[r['id'] for r in self.call(self.clients['create-outsider'],'state')[1]['reports']])
         self.assertEqual(self.call(self.clients['create-outsider'],'reports',{**self.creation_payload,'inherit_id':private['id']})[0],403)
 
+    def test_z_category_delete_guards(self):
+        """分类删除：只有「空、无子级、无研报、无审批流引用」的才允许，且仅管理员。
+
+        命名带 z，排在最后执行，避免这里新建的研报影响前面的编号断言。
+        """
+        helper='分类删除验证'
+        status, empty = self.call(self.admin,'category-tree',{'label':helper,'parent_id':None,'folder':False,'sort_order':99,'enabled':True})
+        self.assertEqual(status,200,empty)
+        self.assertEqual(self.call(self.owner,'category-tree',{'action':'delete','id':empty['id']})[0],403)
+        self.assertEqual(self.call(self.admin,'category-tree',{'action':'delete','id':empty['id']})[0],200)
+        self.assertNotIn(empty['id'],[c['id'] for c in self.call(self.admin,'state')[1]['category_tree']])
+        self.assertEqual(self.call(self.admin,'category-tree',{'action':'delete','id':999999})[0],400)
+        # 有子分类：先挡住父级；子级有研报后同样挡住
+        _, parent = self.call(self.admin,'category-tree',{'label':helper+'目录','parent_id':None,'folder':True,'sort_order':99,'enabled':True})
+        _, child = self.call(self.admin,'category-tree',{'label':helper+'子分类','parent_id':parent['id'],'folder':False,'sort_order':0,'enabled':True})
+        self.assertEqual(self.call(self.admin,'category-tree',{'action':'delete','id':parent['id']})[0],400,'有子分类的目录不能删')
+        self.create(category_id=child['id'])
+        self.assertEqual(self.call(self.admin,'category-tree',{'action':'delete','id':child['id']})[0],400,'已有研报的分类不能删')
+
     def test_all_enabled_categories(self):
         st=self.call(self.admin,'state')[1]
         for node in st['category_tree']:
@@ -160,8 +179,36 @@ class ReportCreation(Workflow):
             self.assertEqual(len(json.loads(r['document'])['sections']),len(cat['config']['sections']))
 
 
+    def test_z_author_user_delete_guards(self):
+        """作者与账号删除=逻辑删除：行保留、列表不再返回、姓名腾出可重建、已删账号不能登录。
+
+        命名带 z，排在最后执行；删的是本类自己建的临时数据（含已被署名的「研究中心」），
+        不影响前面用例的编号与署名断言。
+        """
+        status,tmp=self.call(self.admin,'catalog',{'kind':'authors','name':'删除验证作者','types':['日报'],'license':'','enabled':True})
+        self.assertEqual(status,200,tmp)
+        self.assertEqual(self.call(self.owner,'catalog',{'action':'delete','kind':'authors','id':tmp['id']})[0],403,'仅管理员可删基础资料')
+        self.assertEqual(self.call(self.admin,'catalog',{'action':'delete','kind':'authors','id':tmp['id']})[0],200)
+        self.assertNotIn(tmp['id'],[a['id'] for a in self.call(self.admin,'state')[1]['authors']])
+        again=self.call(self.admin,'catalog',{'kind':'authors','name':'删除验证作者','types':['日报'],'license':'','enabled':True})
+        self.assertEqual(again[0],200,'逻辑删除应腾出姓名，同名可重建：%s'%(again[1],))
+        self.assertNotEqual(again[1]['id'],tmp['id'],'重建的是新行，旧行只是被标记删除')
+        self.assertEqual(self.call(self.admin,'catalog',{'action':'delete','kind':'authors','id':again[1]['id']})[0],200)
+        self.assertEqual(self.call(self.admin,'catalog',{'action':'delete','kind':'authors','id':999999})[0],400)
+        # 已署名研报的作者也能删：署名是创建时的快照，历史报告不受影响
+        self.assertEqual(self.call(self.admin,'catalog',{'action':'delete','kind':'authors','id':self.by['id']})[0],200)
+        self.assertNotIn(self.by['id'],[a['id'] for a in self.call(self.admin,'state')[1]['authors']])
+        # 账号：删掉后列表消失、不能登录，但同名可重建
+        self.assertEqual(self.call(self.owner,'users',{'action':'delete','id':self.ids['create-outsider']})[0],403)
+        self.assertEqual(self.call(self.admin,'users',{'action':'delete','id':self.ids['create-outsider']})[0],200)
+        self.assertNotIn(self.ids['create-outsider'],[u['id'] for u in self.call(self.admin,'state')[1]['users']])
+        self.assertEqual(self.call(self.client(),'login',{'name':'create-outsider','password':'123456'})[0],401,'已删除账号不能再登录')
+        self.assertEqual(self.call(self.admin,'users',{'name':'create-outsider','password':'123456','role':'researcher'})[0],200,'逻辑删除后应能重建同名账号')
+        self.assertEqual(self.call(self.admin,'users',{'action':'delete','id':self.ids['admin']})[0],400,'不能删自己')
+        self.assertEqual(self.call(self.admin,'users',{'action':'delete','id':999999})[0],404)
+
 def load_tests(loader, tests, pattern):
-    names=['test_creation_matrix','test_parallel_creation_numbers','test_required_and_invalid_fields','test_category_author_and_commodity_controls','test_inheritance_and_visibility','test_all_enabled_categories']
+    names=['test_creation_matrix','test_parallel_creation_numbers','test_required_and_invalid_fields','test_category_author_and_commodity_controls','test_inheritance_and_visibility','test_all_enabled_categories','test_z_category_delete_guards','test_z_author_user_delete_guards']
     return unittest.TestSuite(ReportCreation(name) for name in names)
 
 if __name__=='__main__':unittest.main(verbosity=2)

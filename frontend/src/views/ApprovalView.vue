@@ -1,6 +1,6 @@
 <template>
   <div>
-    <PageHead title="审核中心" description="按当前账号的节点资格显示待处理事项；已处理记录可在报告的版本留痕中查看。" />
+    <PageContainer title="审核中心">
 
     <div class="panel">
       <el-tabs v-model="scope" class="list-tabs">
@@ -8,17 +8,18 @@
         <el-tab-pane label="已处理" name="handled" />
         <el-tab-pane label="我发起的" name="initiated" />
       </el-tabs>
-      <ReportTable :reports="list" empty-text="当前页签暂无研报" @open="openReport" @more="openMore" />
+      <ReportTable :reports="list" empty-text="当前页签暂无研报" @open="openReport" @edit="editReport" @more="openMore" />
     </div>
 
-    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" />
+    <ReportActionDialog v-model="moreVisible" :report-id="moreId" @open="openReport" @edit="editReport" />
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import ReportTable from '../components/ReportTable.vue';
 import ReportActionDialog from '../components/ReportActionDialog.vue';
 import { reports, user } from '../store/session';
@@ -39,7 +40,9 @@ const list = computed(() => {
   return sortReports(filtered);
 });
 
-const openReport = id => router.push({ name: 'editor', params: { id } });
+/* 审核也先看详情，审批动作仍在详情页顶部，不会误进编辑态。 */
+const openReport = id => router.push({ name: 'editor', params: { id }, query: { mode: 'view' } });
+const editReport = id => router.push({ name: 'editor', params: { id } });
 
 function openMore(id) {
   moreId.value = id;

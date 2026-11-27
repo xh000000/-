@@ -18,7 +18,7 @@ import json
 import math
 import re
 
-from sqlalchemy import func, inspect, select, update, or_, text
+from sqlalchemy import delete, func, inspect, select, update, or_, text
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -509,16 +509,45 @@ def rename_group(session, group_id: int, name: str, code=None) -> DimGroup:
     return group
 
 
-def delete_group(session, group_id: int) -> None:
-    """只允许删空分组。组里还有指标时要求先移走，避免连指标一起消失。"""
+def delete_group(session, group_id: int, cascade: bool = False) -> dict:
+    """删除分组。
+
+    默认只允许删空组（组内有指标时要求先移走），避免误操作连带丢指标；
+    ``cascade=True`` 时连组内指标一起删——界面上点一级分组的「删除」走的这条路，
+    删除前已在确认框里讲清楚会连带删除组内指标与历史数据。
+
+    系统分组（如「未分组」）任何情况下都不删，它负责接住没归类的指标。
+    """
     group = find_group(session, group_id)
     if group.builtin:
         raise ValueError('系统分组不能删除')
-    count = session.execute(select(func.count()).select_from(DimIndicator)
-                            .where(DimIndicator.group_id == group.id)).scalar() or 0
-    if count:
-        raise ValueError('分组下还有 %d 个指标，请先移走或删除' % count)
+    rows = session.execute(select(DimIndicator)
+                           .where(DimIndicator.group_id == group.id)).scalars().all()
+    if rows and not cascade:
+        raise ValueError('分组下还有 %d 个指标，请先移走或删除' % len(rows))
+    removed_indicators = 0
+    removed_points = 0
+    if rows:
+        ids = [row.id for row in rows]
+        names = [row.name for row in rows]
+        removed_points = session.execute(
+            delete(Observation).where(or_(Observation.indicator_id.in_(ids),
+                                          Observation.indicator.in_(names)))
+        ).rowcount or 0
+        # 数据源候选清单里也去掉这些名字，避免下拉里留下已删除的指标
+        for item in session.execute(select(DataSource)).scalars():
+            patched = item.scope_items
+            for name in names:
+                step = _replace_in_list(patched, name, '')
+                if step is not None:
+                    patched = step
+            if patched != item.scope_items:
+                item.scope_items = json.dumps([x for x in json.loads(patched) if x], ensure_ascii=False)
+        removed_indicators = session.execute(
+            delete(DimIndicator).where(DimIndicator.id.in_(ids))
+        ).rowcount or 0
     session.delete(group)
+    return {'removed_indicators': removed_indicators, 'removed_points': removed_points}
 
 
 def _replace_in_list(raw, old: str, new: str) -> str | None:

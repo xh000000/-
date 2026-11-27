@@ -1,11 +1,12 @@
 <template>
   <div>
-    <PageHead :title="title" :description="description">
-      <el-button @click="openFolderDialog">新建文件夹</el-button>
-      <el-button type="primary" @click="openUploadDialog">
-        {{ area === 'docs' ? '新建文档' : isMaterials ? '上传素材' : '上传文件' }}
-      </el-button>
-    </PageHead>
+    <PageContainer :title="title">
+      <template #actions>
+        <el-button @click="openFolderDialog">新建文件夹</el-button>
+        <el-button type="primary" @click="openUploadDialog">
+          {{ area === 'docs' ? '新建文档' : isMaterials ? '上传素材' : '上传文件' }}
+        </el-button>
+      </template>
 
     <div class="panel" style="padding: 0">
       <div class="lib-toolbar">
@@ -172,6 +173,7 @@
         <el-button link type="primary" @click="download(lightbox.id)">下载原图</el-button>
       </div>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
@@ -180,7 +182,7 @@ import { computed, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { Folder } from '@element-plus/icons-vue';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api, downloadUrl, fileUrl } from '../api';
 import { library, memberName, refresh, user } from '../store/session';
 import { fileSize, localTime } from '../utils/format';

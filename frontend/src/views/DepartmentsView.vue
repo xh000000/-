@@ -1,8 +1,9 @@
 <template>
   <div>
-    <PageHead title="部门管理" description="维护部门与分组，最多支持两级结构（部门 → 分组）。">
-      <el-button type="primary" @click="openDept(null)">新建部门</el-button>
-    </PageHead>
+    <PageContainer title="部门管理">
+      <template #actions>
+        <el-button type="primary" @click="openDept(null)">新建部门</el-button>
+      </template>
 
     <div class="panel">
       <div class="panel-header">
@@ -56,20 +57,20 @@
           <el-switch v-model="deptForm.enabled" />
         </el-form-item>
       </el-form>
-      <p class="caption">部门最多两级，分组下不能再建分组；同级不允许重名。</p>
       <template #footer>
         <el-button @click="deptVisible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="saveDept">保存</el-button>
       </template>
     </el-dialog>
 
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { computed, reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { departments, refresh } from '../store/session';
 

@@ -1,13 +1,10 @@
 <template>
   <div>
     <PageContainer title="指标管理">
+      <template #actions>
+        <el-button type="primary" @click="openAdd()">新增指标</el-button>
+      </template>
       <div class="panel">
-        <div class="panel-toolbar">
-          <el-button v-if="selected.length" type="danger" plain :loading="removing" @click="removeSelected">
-            删除选中（{{ selected.length }}）
-          </el-button>
-          <el-button type="primary" @click="openAdd()">新增指标</el-button>
-        </div>
         <el-table
           ref="tableRef"
           :data="treeRows"
@@ -19,9 +16,7 @@
           size="small"
           border
           @header-dragend="onHeaderDragend"
-          @selection-change="onSelectionChange"
         >
-          <el-table-column type="selection" width="42" :selectable="row => !row.isGroup" />
           <el-table-column label="分组 / 指标名" min-width="240">
             <template #default="{ row }">
               <template v-if="row.isGroup">
@@ -51,8 +46,8 @@
                   :title="row.builtin ? '系统分组不可改名' : '重命名分组'" @click="openGroupForm(row)"
                 >编辑</el-button>
                 <el-button
-                  link type="danger" size="small" :disabled="row.count > 0 || row.builtin"
-                  :title="row.builtin ? '系统分组不可删除' : (row.count ? `组内还有 ${row.count} 个指标，先移出或删除` : '删除空分组')"
+                  link type="danger" size="small" :disabled="row.builtin"
+                  :title="row.builtin ? '系统分组不可删除' : (row.count ? `删除分组及组内 ${row.count} 个指标` : '删除空分组')"
                   @click="removeGroup(row)"
                 >删除</el-button>
               </template>
@@ -182,8 +177,6 @@ import { commodities } from '../store/session';
 const library = ref([]);
 const loading = ref(true);
 const saving = ref(false);
-const removing = ref(false);
-const selected = ref([]);
 const presetItems = ref([]);
 const dialogVisible = ref(false);
 /* 弹窗只有一个，靠 mode 决定显示哪几层：add=新增指标 / edit=编辑指标 / group=新建或重命名分组 */
@@ -363,10 +356,6 @@ function resetDialog() {
   });
 }
 
-function onSelectionChange(rows) {
-  selected.value = rows;
-}
-
 async function load() {
   loading.value = true;
   try {
@@ -451,16 +440,22 @@ async function saveGroup() {
   }
 }
 
+/* 一级分组：点删除即可删。组内有指标时一并删除（含其历史数据），
+   所以确认框要把「删几个指标」说清楚，不做静默连带。 */
 async function removeGroup(row) {
+  const tip = row.count
+    ? `分组「${row.group}」下有 ${row.count} 个指标，删除分组会一并删除这些指标及其历史数据，且不可恢复。确认删除？`
+    : `删除空分组「${row.group}」？`;
   try {
-    await ElMessageBox.confirm(`删除分组「${row.group}」？组内还有指标时不能删除。`, '删除分组', {
+    await ElMessageBox.confirm(tip, '删除分组', {
       confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning',
     });
   } catch { return; }
   try {
-    const result = await api('data/scope-library/group/delete', { id: row.groupId });
+    const result = await api('data/scope-library/group/delete', { id: row.groupId, cascade: true });
     library.value = result.library || [];
-    ElMessage.success('已删除分组');
+    const removed = result.removed_indicators || 0;
+    ElMessage.success(removed ? `已删除分组及组内 ${removed} 个指标` : '已删除分组');
   } catch (error) {
     ElMessage.error(error.message || '删除分组失败');
   }
@@ -480,23 +475,13 @@ async function removeOne(row) {
   await postDelete([row.indicatorId]);
 }
 
-async function removeSelected() {
-  const names = selected.value.map(row => row.name);
-  const preview = names.slice(0, 4).join('、') + (names.length > 4 ? ` 等 ${names.length} 项` : '');
-  if (!await confirmRemove(`删除指标：${preview}？`)) return;
-  await postDelete(selected.value.map(row => row.indicatorId));
-}
-
 async function postDelete(ids) {
-  removing.value = true;
   try {
     const result = await api('data/scope-library/delete', { ids });
     library.value = result.library || [];
     ElMessage.success(`已删除 ${result.removed ?? ids.length} 项`);
   } catch (error) {
     ElMessage.error(error.message || '删除失败');
-  } finally {
-    removing.value = false;
   }
 }
 
@@ -504,16 +489,16 @@ onMounted(load);
 </script>
 
 <style scoped>
-:deep(.el-table) { --el-table-border-color: #eef2f7; }
+
 .lib-unclassified { color: #e6a23c; }
 /* 一级目录：就是一行字，不加任何标签底色 */
-.lib-group-name { font-weight: 600; color: #183153; }
+.lib-group-name { font-weight: 600; color: var(--ink-1); }
 .lib-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #64748b; letter-spacing: 0.02em; }
 .lib-warn { color: #e6a23c; }
-.lib-newgroup { color: #409eff; }
+.lib-newgroup { color: var(--accent); }
 /* 表单与树同构：一级在上、二级缩进在下，用一条折线表达从属关系 */
 .lib-treeform { display: flex; flex-direction: column; gap: 18px; }
-.lib-treeform-node { position: relative; border: 1px solid #e6ecf4; border-radius: 10px; padding: 12px 14px; }
+.lib-treeform-node { position: relative; border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
 /* 一级只是归属说明，不是内容块：不加卡片外观，直接排字 */
 .lib-treeform-node.is-parent { border: 0; border-radius: 0; padding: 0; background: none; }
 .lib-treeform-node.is-child { margin-left: 24px; background: #fff; }

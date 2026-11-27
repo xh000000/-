@@ -9,7 +9,7 @@
         </p>
 
         <div class="row" style="flex-wrap: wrap; gap: 8px">
-          <el-button @click="act('open')">{{ editable ? '编辑' : '查看' }}</el-button>
+          <el-button @click="act('open')">{{ editable ? '编辑' : '查看详情' }}</el-button>
           <el-button v-if="can('提交')" type="primary" plain @click="act('submit')">提交审批</el-button>
           <el-button v-if="can('通过')" type="primary" @click="act('approve')">审核通过</el-button>
           <el-button v-if="can('退回')" type="warning" plain @click="act('reject')">驳回</el-button>
@@ -59,7 +59,7 @@ import { api, printUrl } from '../api';
 import { refresh, reports, user } from '../store/session';
 
 const props = defineProps({ reportId: { type: [Number, String], default: null } });
-const emit = defineEmits(['open']);
+const emit = defineEmits(['open', 'edit']);
 const visible = defineModel({ type: Boolean, default: false });
 
 const router = useRouter();
@@ -69,9 +69,13 @@ const scheduleAt = ref('');
 
 const report = computed(() => reports.value.find(item => item.id === Number(props.reportId)) || null);
 const owner = computed(() => report.value && (report.value.author === user.value.id || user.value.role === 'admin'));
-const editable = computed(
-  () => report.value && report.value.author === user.value.id && ['草稿', '已退回'].includes(report.value.status)
-);
+const editable = computed(() => {
+  const current = report.value;
+  if (!current) return false;
+  // 服务端 can_edit 已考虑状态与作者/协作关系，避免这里和编辑器判断不一致
+  if (typeof current.can_edit === 'boolean') return current.can_edit;
+  return current.author === user.value.id && ['草稿', '已退回'].includes(current.status);
+});
 const can = action => Boolean(report.value?.allowed_actions?.includes(action));
 
 async function act(name) {
@@ -79,7 +83,7 @@ async function act(name) {
   if (!current) return;
   if (name === 'open') {
     visible.value = false;
-    emit('open', current.id);
+    emit(editable.value ? 'edit' : 'open', current.id);
     return;
   }
   if (name === 'print') {

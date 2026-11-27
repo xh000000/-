@@ -6,15 +6,16 @@
         <strong :title="title">{{ title || report.title }}</strong>
         <StatusTag :report="report" />
         <span class="caption">v{{ report.version }}</span>
+        <el-tag v-if="detailMode" size="small" type="info" effect="plain" disable-transitions>详情</el-tag>
         <el-tag v-if="dirty" size="small" type="warning" effect="plain" disable-transitions>未保存</el-tag>
       </div>
       <div class="actions">
-        <el-button @click="openInfo">基础信息</el-button>
+        <el-button v-if="detailMode && canEditReport" type="primary" @click="switchToEdit">编辑研报</el-button>
+        <el-button @click="openInfo">{{ detailMode ? '报告信息' : '基础信息' }}</el-button>
         <el-button v-if="shared && creator && editable" @click="openAssignments">章节分工</el-button>
-        <el-button v-if="canUseSkills && editable && report.document" type="primary" plain @click="openSkillGenerator">AI / Skill 生成</el-button>
         <el-button v-if="report.document" @click="openPreview">预览</el-button>
         <el-button @click="openPrint">打印 / PDF</el-button>
-        <el-button v-if="report.can_schedule" @click="openSchedule">定时发布</el-button>
+        <el-button v-if="report.can_schedule && !detailMode" @click="openSchedule">定时发布</el-button>
         <el-button
           v-for="action in report.allowed_actions || []"
           :key="action"
@@ -26,8 +27,14 @@
       </div>
     </div>
 
+    <div v-if="!canEditReport && editReason" class="edit-lock">
+      <el-icon><Lock /></el-icon>
+      <span>{{ editReason }}</span>
+      <el-button v-if="canWithdraw" size="small" @click="withdrawForEdit">撤销送审</el-button>
+    </div>
+
     <div v-if="aiSetup && shared && creator && editable" class="panel" style="margin:12px 0;padding:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-      <div style="flex:1;min-width:240px"><b>先分配章节，再开始 AI 写作</b><p class="caption" style="margin:6px 0 0">在集中分工窗口批量分配各章负责人，也可单章调整。AI 可统一生成整篇候选，各章负责人分别核对采用。</p></div>
+      <div style="flex:1;min-width:240px"><b>先分配章节，再开始 AI 写作</b></div>
       <el-button @click="openAssignments">设置章节分工</el-button>
       <el-button type="primary" @click="beginSharedAI">完成分工，开始 AI 生成</el-button>
     </div>
@@ -36,7 +43,7 @@
     <div v-if="!report.document" class="legacy-wrap">
       <div class="panel">
         <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 14px">
-          此报告为旧版纯文本正文，可继续使用，或转换为组件文档后按章节协作。
+          {{ detailMode ? '此报告为旧版纯文本正文，当前为只读详情。' : '此报告为旧版纯文本正文，可继续使用，或转换为组件文档后按章节协作。' }}
         </el-alert>
         <el-form label-width="88px">
           <el-form-item label="报告标题">
@@ -68,7 +75,7 @@
     <!-- 组件化编辑器 -->
     <div v-else-if="draft" class="edit-body">
       <aside class="chapter-list">
-        <div v-if="report.category_id" class="chapter-template">
+        <div v-if="report.category_id && !detailMode" class="chapter-template">
           <span>分类模板：{{ templateInfo?.category_name || paperCfg.category_name || '当前分类' }}</span>
           <small>章节/审批 v{{ paperCfg.revision || '—' }}<template v-if="templateInfo"> · 最新 v{{ templateInfo.revision }}</template></small>
           <el-button v-if="creator && editable" link type="primary" :loading="templateLoading" :disabled="busy" @click="openTemplateSync">同步分类章节与审批</el-button>
@@ -110,7 +117,8 @@
 
       <section class="chapter-main">
         <div class="chapter-toolbar">
-          <el-input v-model="title" class="title-input" placeholder="报告标题" :readonly="!editable" />
+          <h1 v-if="detailMode" class="detail-title">{{ title || report.title }}</h1>
+          <el-input v-else v-model="title" class="title-input" placeholder="报告标题" :readonly="!editable" />
           <span class="sep"></span>
           <template v-if="sectionEditable">
             <el-button size="small" @click="insert('text')">＋ 文字</el-button>
@@ -122,9 +130,10 @@
             <el-button size="small" @mousedown.prevent="exec('italic')"><i>I</i></el-button>
             <el-button size="small" @mousedown.prevent="exec('underline')"><u>U</u></el-button>
             <el-button size="small" @mousedown.prevent="exec('insertUnorderedList')">•</el-button>
-            <el-button size="small" @click="openSkillGenerator(section.id)">AI 生成本章候选</el-button>
+            <span class="sep"></span>
+            <el-button size="small" type="primary" plain title="默认只生成本章候选，可在弹窗里改选其他章节或整篇" @click="openSkillGenerator(section.id)">AI 生成</el-button>
           </template>
-          <span v-else class="caption">本章节不可编辑（已提交或未分配给你）</span>
+          <span v-else class="caption">{{ detailMode ? '只读浏览' : '本章节不可编辑（已提交或未分配给你）' }}</span>
           <span class="grow"></span>
           <span class="caption">本章 {{ section?.state || '未提交' }} · v{{ section?.revision }}</span>
           <template v-if="sectionEditable">
@@ -136,6 +145,17 @@
             <el-button v-if="section?.state !== '已提交'" size="small" @click="chapterState('submit')">提交章节</el-button>
             <el-button v-else size="small" @click="chapterState('reopen')">撤销提交</el-button>
           </template>
+        </div>
+
+        <div v-if="detailMode" class="detail-meta">
+          <span v-if="categoryLabel">分类：{{ categoryLabel }}</span>
+          <span>创建人：{{ report.author_name }}</span>
+          <span v-if="report.updated_by">更新人：{{ report.updated_by }}</span>
+          <span>更新：{{ localTime(report.updated) }}</span>
+          <span v-if="report.published_at || report.approved_at">发布：{{ localTime(report.published_at || report.approved_at) }}</span>
+          <span>第 {{ report.issue || 1 }} 期</span>
+          <span>PV {{ report.views || 0 }}</span>
+          <span v-if="nodeText">{{ nodeText }}</span>
         </div>
 
         <div class="canvas-scroll">
@@ -426,7 +446,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { Document, Grid, Loading, Picture, Setting, TrendCharts } from '@element-plus/icons-vue';
+import { Document, Grid, Loading, Lock, Picture, Setting, TrendCharts } from '@element-plus/icons-vue';
 import ReportBlock from '../components/ReportBlock.vue';
 import StatusTag from '../components/StatusTag.vue';
 import AiReportGenerator from '../components/AiReportGenerator.vue';
@@ -435,6 +455,7 @@ import { api, fileUrl, printUrl } from '../api';
 import {
   authors, commodities, library, memberName, indicators, refresh, reportById, user,
 } from '../store/session';
+import { pauseLive, resumeLive } from '../store/live';
 import { localTime, escapeHtml, makeId, parseJSON, statusText, today, MODE_NAMES } from '../utils/format';
 
 const assignmentsVisible = ref(false);
@@ -466,11 +487,68 @@ const paperCfg = computed(() => parseJSON(report.value?.config_snapshot, {}) || 
 const shared = computed(() => meta.value?.collaboration === 'shared');
 const creator = computed(() => report.value?.author === user.value.id);
 const canUseSkills = computed(() => ['admin','researcher'].includes(user.value.role) && (creator.value || (meta.value?.collaborators || []).includes(user.value.id)));
-const editable = computed(
-  () => Boolean(report.value) && ['草稿', '已退回'].includes(report.value.status) &&
-    (shared.value ? true : report.value.author === user.value.id)
-);
-const legacyEditable = computed(() => creator.value && ['草稿', '已退回'].includes(report.value?.status));
+/* 详情模式：列表点进来默认只读，显式点「编辑研报」才进入编辑态。
+   这样「看一眼」不会被当成「打开就能改」，也避免误触改到草稿。 */
+const detailMode = computed(() => route.query.mode === 'view');
+/* 是否可改由服务端判定（can_edit + edit_reason + current_node）：
+   送审后不管是作者还是审批人都不能改正文，只有草稿/已退回可写。
+   旧数据没有这些字段时按原规则兜底。 */
+const canEditReport = computed(() => {
+  const current = report.value;
+  if (!current) return false;
+  if (typeof current.can_edit === 'boolean') return current.can_edit;
+  return ['草稿', '已退回'].includes(current.status) &&
+    (shared.value ? true : current.author === user.value.id);
+});
+const editReason = computed(() => report.value?.edit_reason || '');
+const nodeText = computed(() => {
+  const node = report.value?.current_node;
+  if (!node) return '';
+  const who = node.pending?.length ? node.pending.join('、') : (node.role_label || '指定审批人');
+  return `审批节点：${node.label}（${node.index}/${node.total}）· 待 ${who} 处理`;
+});
+const editable = computed(() => canEditReport.value && !detailMode.value);
+/* 在途报告只有作者能撤销；撤销即回到「已退回」，是可编辑在途报告的唯一正规入口 */
+const canWithdraw = computed(() => {
+  const current = report.value;
+  return Boolean(current) && current.author === user.value.id &&
+    !['草稿', '已退回', '已撤销'].includes(current.status);
+});
+
+async function withdrawForEdit() {
+  const current = report.value;
+  if (!current) return;
+  let note = '';
+  try {
+    const result = await ElMessageBox.prompt(
+      '撤销后退出当前审批 / 发布状态，报告回到「已退回」并可修改；已产生的历史定稿与审批记录会保留。',
+      '撤销并编辑',
+      { confirmButtonText: '确认撤销', cancelButtonText: '取消', inputType: 'textarea',
+        inputPlaceholder: '请填写撤销原因', inputValidator: v => Boolean(v?.trim()) || '必须填写撤销原因' }
+    );
+    note = result.value;
+  } catch {
+    return;
+  }
+  try {
+    await api('report-withdraw', { id: current.id, note });
+    await refresh();
+    const query = { ...route.query };
+    delete query.mode;
+    await router.replace({ path: route.path, query });
+    ElMessage.success('已撤销，报告回到可编辑状态');
+  } catch (error) {
+    ElMessage.error(error.message || '撤销失败');
+  }
+}
+const legacyEditable = computed(() => creator.value && ['草稿', '已退回'].includes(report.value?.status) && !detailMode.value);
+const categoryLabel = computed(() => String(paperCfg.value?.category_name || report.value?.kind || '').trim());
+
+function switchToEdit() {
+  const query = { ...route.query };
+  delete query.mode;
+  router.replace({ path: route.path, query });
+}
 
 const draft = ref(null);
 const title = ref('');
@@ -481,6 +559,25 @@ const legacy = reactive({ title: '', body: '' });
 let draftId = null;
 let draftVersion = 0;
 let snapshot = '';
+
+/* 有未保存改动时暂停全局自动刷新：全量快照会按版本重建草稿，冲掉正在输入的正文。
+   计数要严格配对——卸载时补一次释放，否则整个会话的自动刷新会被永久按住。 */
+let holdingLive = false;
+watch(dirty, value => {
+  if (value && !holdingLive) {
+    holdingLive = true;
+    pauseLive();
+  } else if (!value && holdingLive) {
+    holdingLive = false;
+    resumeLive();
+  }
+});
+onBeforeUnmount(() => {
+  if (holdingLive) {
+    holdingLive = false;
+    resumeLive();
+  }
+});
 
 const section = computed(() => draft.value?.sections?.[chapterIndex.value] || null);
 const freePaperHeight = computed(() => draft.value?.layout === 'free'
@@ -611,6 +708,7 @@ watch([title, draft], () => {
 
 function chapterEditable(item) {
   const current = report.value;
+  if (detailMode.value) return false;
   if (!current || !['草稿', '已退回'].includes(current.status)) return false;
   const info = parseJSON(current.metadata, null);
   if (!info || info.collaboration !== 'shared') return current.author === user.value.id;
@@ -876,7 +974,7 @@ async function loadPreview() {
   }
 }
 const info = reactive({ title: '', summary: '', byline_id: null, report_date: today(), public: true });
-const infoEditable = computed(() => creator.value && ['草稿', '已退回'].includes(report.value?.status));
+const infoEditable = computed(() => creator.value && ['草稿', '已退回'].includes(report.value?.status) && !detailMode.value);
 const bylineOptions = computed(() => {
   const kind = report.value?.kind;
   const current = meta.value?.byline_id;

@@ -1,11 +1,9 @@
 <template>
   <div>
-    <PageHead
-      title="角色管理"
-      description="角色由「角色类型」决定审批资格，由「菜单权限」决定可访问的功能；管理员固定拥有全部权限。"
-    >
-      <el-button type="primary" @click="openDialog(null)">添加角色</el-button>
-    </PageHead>
+    <PageContainer title="角色管理">
+      <template #actions>
+        <el-button type="primary" @click="openDialog(null)">添加角色</el-button>
+      </template>
 
     <div class="panel">
       <el-table :data="roles" empty-text="暂无角色">
@@ -63,25 +61,24 @@
           </el-select>
         </el-form-item>
         <el-form-item label="菜单权限">
-          <div v-if="form.base_role === 'admin'" class="caption">管理员固定拥有全部菜单权限。</div>
-          <el-checkbox-group v-else v-model="form.menus" class="menu-checks">
+          <el-checkbox-group v-model="form.menus" class="menu-checks">
             <el-checkbox v-for="key in MENU_KEYS" :key="key" :value="key">{{ key }}</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
       </el-form>
-      <p class="caption">角色类型决定审批与发布资格：研究员投稿、研究复核与合规审核终审、发布专员发布；作者不能审核自己的报告。</p>
       <template #footer>
         <el-button @click="visible = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="save">保存</el-button>
       </template>
     </el-dialog>
+    </PageContainer>
   </div>
 </template>
 
 <script setup>
 import { reactive, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import PageHead from '../components/PageHead.vue';
+import PageContainer from '../components/PageContainer.vue';
 import { api } from '../api';
 import { refresh, roles } from '../store/session';
 import { MENU_KEYS, ROLE_NAMES } from '../utils/format';

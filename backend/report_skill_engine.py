@@ -102,6 +102,27 @@ def save(s, data, user, stamp):
     return {'id':value['id']}
 
 
+def delete(s, data, user, stamp):
+    """删除自定义 Skill；内置只读、不可删。CAS 更新避免覆盖别人的修改。"""
+    import app
+    before = state(s)
+    if data.get('revision')!=before['revision']: raise app.ApiError(409,'Skill 列表已更新，请刷新')
+    sid = str(data.get('id') or '')
+    if sid in BUILTINS: raise ValueError('内置 Skill 不可删除')
+    if not any(x['id']==sid for x in before['skills']): raise ValueError('Skill 不存在或已删除')
+    updated = {'revision':before['revision']+1,'skills':[x for x in before['skills'] if x['id']!=sid]}
+    row = s.get(AppSetting,KEY)
+    if not row: raise ValueError('Skill 不存在或已删除')
+    old_value = row.value
+    changed = s.execute(update(AppSetting).where(AppSetting.key==KEY,AppSetting.value==old_value)
+                        .values(value=json.dumps(updated,ensure_ascii=False),updated=stamp)).rowcount
+    if changed!=1: raise app.ApiError(409,'Skill 列表已更新，请刷新')
+    try: s.commit()
+    except IntegrityError:
+        s.rollback(); raise app.ApiError(409,'Skill 列表已更新，请刷新')
+    return {'id':sid,'deleted':True}
+
+
 TEXT_EXTENSIONS = {'.md', '.txt', '.json', '.csv'}
 MAX_ZIP_BYTES = 2 * 1024 * 1024
 

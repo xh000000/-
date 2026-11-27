@@ -251,7 +251,8 @@ def schedule_due() -> None:
                                                     AgentTask.created_at.like(today + '%'))).first()
         if done:
             return
-        admin = s.execute(select(db.User).where(db.User.role == 'admin', db.User.enabled == 1)
+        admin = s.execute(select(db.User).where(db.User.role == 'admin', db.User.enabled == 1,
+                                                func.coalesce(db.User.status, 1) == 1)
                           .order_by(db.User.id)).scalars().first()
         if admin is None:
             print('pipeline: 未找到启用的管理员账号，定时日报跳过', flush=True)

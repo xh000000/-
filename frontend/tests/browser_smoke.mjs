@@ -157,13 +157,36 @@ try {
     await page.waitForFunction(() => document.querySelector('.edit-top .actions button'), { timeout: 20000 });
     await new Promise(resolve => setTimeout(resolve, 800));
 
+    /* 列表点标题现在先进只读详情（?mode=view），详情里确认没有编辑工具条，
+       再点「编辑研报」进入编辑态，后面的编辑器弹窗仍按原路径验证。 */
+    const detail = await page.evaluate(() => ({
+      view: new URLSearchParams(location.search).get('mode') === 'view',
+      title: !!document.querySelector('.detail-title'),
+      insertButtons: [...document.querySelectorAll('.chapter-toolbar button')].length,
+    }));
+    const editable = await page.evaluate(() => {
+      const button = [...document.querySelectorAll('.edit-top .actions button')].find(el => el.innerText.trim() === '编辑研报');
+      if (!button) return false;
+      button.click();
+      return true;
+    });
+    if (editable) {
+      await page.waitForFunction(() => document.querySelector('.title-input'), { timeout: 10000 });
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    console.log(`${detail.view && detail.title && !detail.insertButtons ? 'ok   ' : 'FAIL '}详情只读    ${detail.view ? '?mode=view' : '缺 mode'} / ${detail.title ? '标题为静态' : '标题仍是输入框'} / 插入按钮 ${detail.insertButtons} 个`);
+    if (!editable) console.log('skip 编辑态   该报告当前不可编辑，跳过编辑器弹窗');
+
     const openDialog = async label => {
-      const clicked = await page.evaluate(text => {
-        const btn = [...document.querySelectorAll('.edit-top .actions button')].find(el => el.innerText.trim() === text);
+      // 详情态叫「报告信息」，编辑态叫「基础信息」，两个都认
+      const labels = label === '基础信息' ? ['基础信息', '报告信息'] : [label];
+      const clicked = await page.evaluate(texts => {
+        const buttons = [...document.querySelectorAll('.edit-top .actions button')];
+        const btn = texts.map(text => buttons.find(el => el.innerText.trim() === text)).find(Boolean);
         if (!btn) return false;
         btn.click();
         return true;
-      }, label);
+      }, labels);
       if (!clicked) return { ok: false, reason: '工具栏无此按钮' };
       try {
         await page.waitForFunction(

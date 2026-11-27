@@ -5,8 +5,7 @@ import {
   Tickets, Tools, TrendCharts, User, View,
 } from '@element-plus/icons-vue';
 
-export const MENU = [
-  { label: 'BI看板', icon: DataBoard, disabled: true },
+export const MENU = [  { label: 'BI看板', icon: DataBoard, disabled: true },
   { label: '投研资源库', icon: Collection, disabled: true },
   {
     label: '研报管理', icon: Document, children: [
@@ -88,6 +87,14 @@ export const MENU = [
     ],
   },
 ];
+
+/* 菜单目录存在数据库，图标以名称下发；这里映射成组件，未知名称回落到通用图标。 */
+const ICONS = {
+  Aim, Box, ChatDotRound, Collection, Connection, DataBoard, DataLine, Document, Finished,
+  Grid, MagicStick, Monitor, Odometer, Picture, PieChart, Setting, Share, Tickets, Tools,
+  TrendCharts, User, View,
+};
+export const iconOf = name => ICONS[name] || Setting;
 
 export function breadcrumb(path) {
   if (path === '/') return ['工作台'];

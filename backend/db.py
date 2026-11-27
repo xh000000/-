@@ -149,6 +149,8 @@ class User(Base, MappingMixin):
     role_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[str | None] = mapped_column(big_text(), default='')
     last_login_at: Mapped[str | None] = mapped_column(big_text(), default='')
+    # 1=正常，0=已删除（逻辑删除）。账号行保留下来，历史研报、审批记录与事件里的操作人仍能对上名字
+    status: Mapped[int | None] = mapped_column(Integer, default=1)
 
 
 class SessionRow(Base, MappingMixin):
@@ -185,7 +187,6 @@ class Report(Base, MappingMixin):
     deleted: Mapped[int | None] = mapped_column(Integer, default=0)
     scheduled_at: Mapped[str | None] = mapped_column(big_text(), default='')
     ai_draft: Mapped[int | None] = mapped_column(Integer, default=0)  # 1=含 AI 生成内容，须人工复核
-    ai_summary: Mapped[str | None] = mapped_column(big_text(), default='')  # AI 摘要卡 JSON：核心观点/逻辑链/数据要点
 
 
 class Version(Base, MappingMixin):
@@ -289,6 +290,8 @@ class Author(Base, MappingMixin):
     types: Mapped[str | None] = mapped_column(big_text())
     enabled: Mapped[int | None] = mapped_column(Integer, default=1)
     license: Mapped[str | None] = mapped_column(big_text(), default='')
+    # 1=正常，0=已删除（逻辑删除）；已署名研报的署名是创建时的快照，删掉作者不影响历史报告
+    status: Mapped[int | None] = mapped_column(Integer, default=1)
 
 
 class ApprovalFlow(Base, MappingMixin):
@@ -357,6 +360,40 @@ class AppSetting(Base, MappingMixin):
     __tablename__ = 'app_settings'
     key: Mapped[str] = mapped_column(String(191), primary_key=True)
     value: Mapped[str] = mapped_column(big_text(), default='')
+    updated: Mapped[str | None] = mapped_column(big_text(), default='')
+
+
+class Revision(Base, MappingMixin):
+    """数据版本号，用于把「有变化」推给在线客户端（实时刷新）。
+
+    只有一行（name='state'），任何写操作提交后原子 +1；前端收到变化只重新拉一次
+    /api/state，不关心具体改了什么。刻意落库而不是放进程内存：托管平台可能起多个
+    进程/实例，内存计数器各算各的，只有库里的值对所有实例一致。
+    """
+    __tablename__ = 'revisions'
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[int] = mapped_column(Integer, default=0)
+    updated: Mapped[str | None] = mapped_column(big_text(), default='')
+
+
+class Menu(Base, MappingMixin):
+    """侧栏菜单目录：结构、排序与显示设置都以这张表为准。
+
+    key 是稳定标识（有页面用路由路径，占位/分组用 ``group:名称`` 或
+    ``item:父:子``），改名不会改变标识，便于账号权限与历史设置继续对上。
+    """
+    __tablename__ = 'menus'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    parent_id: Mapped[int | None] = mapped_column(Integer)
+    key: Mapped[str] = mapped_column(String(191), unique=True)
+    label: Mapped[str] = mapped_column(String(60))
+    icon: Mapped[str | None] = mapped_column(String(60), default='')
+    path: Mapped[str | None] = mapped_column(String(191), default='')
+    sort_order: Mapped[int | None] = mapped_column(Integer, default=0)
+    visible: Mapped[int | None] = mapped_column(Integer, default=1)
+    admin_only: Mapped[int | None] = mapped_column(Integer, default=0)
+    disabled: Mapped[int | None] = mapped_column(Integer, default=0)
+    builtin: Mapped[int | None] = mapped_column(Integer, default=1)
     updated: Mapped[str | None] = mapped_column(big_text(), default='')
 
 

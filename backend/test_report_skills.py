@@ -162,6 +162,22 @@ class SkillReports(ReportCreation):
         try:self.client().open(req);self.fail('anonymous import permitted')
         except urllib.error.HTTPError as e:self.assertEqual(e.code,401)
 
+    def test_skill_delete_guards(self):
+        """删除 Skill：自定义可删、内置拒删、版本号过期 409、不存在 400。"""
+        raw='---\nname: temp-skill\ndescription: 临时删除验证\n---\n# 临时方法\n只用于删除用例。'
+        catalog=self.call(self.admin,'report-ai/skills')[1]
+        code,saved=self.call(self.admin,'report-ai/skills',{'revision':catalog['revision'],'name':'待删除Skill','markdown':raw,'enabled':True})
+        self.assertEqual(code,200,saved);sid=saved['id']
+        catalog=self.call(self.admin,'report-ai/skills')[1]
+        builtin=next(x['id'] for x in catalog['skills'] if x['builtin'])
+        self.assertEqual(self.call(self.admin,'report-ai/skills',{'action':'delete','id':builtin,'revision':catalog['revision']})[0],400,'内置不可删')
+        self.assertEqual(self.call(self.admin,'report-ai/skills',{'action':'delete','id':'custom-missing','revision':catalog['revision']})[0],400,'不存在的 Skill')
+        self.assertEqual(self.call(self.admin,'report-ai/skills',{'action':'delete','id':sid,'revision':catalog['revision']-1})[0],409,'版本号过期应冲突')
+        code,out=self.call(self.admin,'report-ai/skills',{'action':'delete','id':sid,'revision':catalog['revision']})
+        self.assertEqual(code,200,out)
+        ids=[x['id'] for x in self.call(self.admin,'report-ai/skills')[1]['skills']]
+        self.assertNotIn(sid,ids);self.assertIn(builtin,ids)
+
     def test_stale_report_and_missing_data(self):
         r=self.report_fixture();tid=self.generate_job(r);self.assertEqual(self.wait_job(tid)['status'],'已完成')
         update=self.call(self.owner,'chapters',{'id':r['id'],'version':r['version'],'section_id':'s1','action':'edit','title':'新标题','editors':[self.ids['create-owner']],'commodity_ids':[]})
@@ -403,6 +419,6 @@ class SkillReports(ReportCreation):
 
 
 def load_tests(loader,tests,pattern):
-    return unittest.TestSuite(SkillReports(x) for x in ['test_recent_jobs_are_owned_and_link_to_report','test_zip_import_preview_and_reference_use','test_whole_report_review_and_version','test_skill_snapshots_and_access','test_stale_report_and_missing_data','test_failure_cancel_and_collaboration','test_shared_generation_and_independent_confirmation','test_shared_conflict_skip_and_submission_guard','test_shared_private_evidence_and_revoked_membership','test_batch_chapter_assignments_atomic_and_versioned','test_creation_with_initial_assignments_and_rollback','test_ai_viewpoint_extraction_source_validation_and_dedup','test_retry_preserves_successful_chapter_and_checks_conflicts','test_evidence_checks_units_sources_and_future_material','test_chat_candidate_uses_shared_apply_path','test_shared_failed_candidate_can_be_discarded_and_retried'])
+    return unittest.TestSuite(SkillReports(x) for x in ['test_recent_jobs_are_owned_and_link_to_report','test_zip_import_preview_and_reference_use','test_whole_report_review_and_version','test_skill_snapshots_and_access','test_stale_report_and_missing_data','test_failure_cancel_and_collaboration','test_shared_generation_and_independent_confirmation','test_shared_conflict_skip_and_submission_guard','test_shared_private_evidence_and_revoked_membership','test_batch_chapter_assignments_atomic_and_versioned','test_creation_with_initial_assignments_and_rollback','test_ai_viewpoint_extraction_source_validation_and_dedup','test_retry_preserves_successful_chapter_and_checks_conflicts','test_evidence_checks_units_sources_and_future_material','test_chat_candidate_uses_shared_apply_path','test_shared_failed_candidate_can_be_discarded_and_retried','test_skill_delete_guards'])
 
 if __name__=='__main__':unittest.main(verbosity=2)
